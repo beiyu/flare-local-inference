@@ -1,7 +1,9 @@
 [ ] Diagnose and qualify full GLM target numerical equivalence between ordinary
     decode and external DFlash2 verification: a public English 64-token case
     diverges at token41 despite passing native/API/cache workloads. Keep the
-    failed comparison; no performance claim yet.
+    failed comparison; no performance claim yet. Native argmax checks pass;
+    width-sensitive mHC arithmetic reproduces in captured component graphs.
+    Trace the first full-model divergence from identical initial state.
     See beiyu-glm.md#native-deployment-and-remaining-numerical-qualification.
 
 [ ] Add GLM video input preprocessing, timestamp/frame-token layout and native

@@ -203,6 +203,51 @@ The completed API and extended results are `api-acceptance-dflash2.json`,
 These remain selected workloads, not proof of complete vLLM parity, video support
 or the entire 65536-token output extent.
 
+### Width-sensitive target arithmetic investigation
+
+A further isolated native probe made 16 requests using the retained public
+workload, zero temperature and seed 1234. Depending on the adaptive verification
+rounds, 64-token continuations matched ordinary decode or first differed at
+generated index 41 or 55. At index 41, the two relevant target logprob scores
+were separated by 0.25 or 0.125, or tied exactly. All 295 recorded raw-completion
+positions chose a maximum target score; all four observed ties followed the
+lowest-token-ID rule. This locates the observed choice changes in target scores,
+rather than a demonstrated failure to follow greedy sampling. These probes
+reused cached prefixes. In particular, the earlier forced-prefix score is not
+an independent fresh-prefill reference.
+
+Real TP2 rank-zero weights also reproduce a width-sensitive mHC result before
+any speculative commit. With identical synthetic first-row inputs, layer 3's fused
+post/pre operation produces two differing BF16 normalized components out of
+4096 between widths one and eight: maximum absolute difference 0.0078125 and
+relative L2 0.000246858. The compiled normalized outputs match their eager
+counterparts exactly at each width; ten captured replays per input are stable.
+Thus a repeatable arithmetic difference exists independently of rejected-state
+rollback or compilation. It has not yet been traced as the first cause in the
+full English workload.
+
+Additional isolation checks narrow the search. Across three synthetic inputs,
+KDA recording leaves the committed checkpoint byte-exact before commit; accepted
+prefixes of 1, 2, 4 and 8 have at most 2.52e-7 relative state error against
+ordinary recurrence. Selected real dense/shared/EXL3 expert checks and the MLA
+absorption/expansion BMM first rows match exactly. The rank-zero vocabulary
+projection matches exactly at all widths 1 through 8 for three inputs. Sparse
+MLA with identical queries, selected records and cache matches at 35 and 71
+records, but differs by about 0.28% relative L2 at 257 and 2051 records; that
+long-context observation does not explain this short reproduction by itself.
+
+The leading explanation is width-sensitive target arithmetic accumulating until
+nearby greedy candidates change order; adaptive timing then changes which
+numerical path a request takes. A full-model trace with identical initial state
+and forced token prefixes is still required to identify the first responsible
+operator and rule out every state-transition issue. The original failed exact
+comparison remains a failure. Component observations are not a replacement
+full-model error bound or a performance qualification. Raw numerical results are
+retained as `dflash2-*-cause.json`, `dflash2-mhc-cause-compiled.json` and
+`dflash2-cause-numeric-summary.json` in the existing Spark output directory.
+No serving code, package, weights or service configuration changed during this
+investigation; both native services remained active.
+
 ## EXL3 GPU qualification
 
 Use a matching Linux preparation environment from `model-preparation.md`. Build
