@@ -19,4 +19,4 @@ exec "$binary" run "$package" --gpus 0 --host 0.0.0.0 --port 9999 \
     --served-model-name GLM-5.3-Flash-EXL3 \
     --served-model-name spark/GLM-5.3-Flash-EXL3 \
     --default-stop-scope after_reasoning --default-max-new-tokens 65536 \
-    --max-images-per-prompt 20 --mtp-draft-tokens 0 "$@"
+    --max-images-per-prompt 20 "$@"

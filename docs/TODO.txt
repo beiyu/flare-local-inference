@@ -1,5 +1,8 @@
-[ ] Add and qualify the deployment's external 7-token DFlash2 drafter in the
-    native GLM package; ordinary EXL3 decode does not establish its equivalence.
+[ ] Diagnose and qualify full GLM target numerical equivalence between ordinary
+    decode and external DFlash2 verification: a public English 64-token case
+    diverges at token41 despite passing native/API/cache workloads. Keep the
+    failed comparison; no performance claim yet.
+    See beiyu-glm.md#native-deployment-and-remaining-numerical-qualification.
 
 [ ] Add GLM video input preprocessing, timestamp/frame-token layout and native
     feature delivery; the current deployment accepts still images only.

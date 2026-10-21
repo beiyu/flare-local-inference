@@ -8,7 +8,14 @@ from .speculative import PreparedPrefill, PreparedRound
 
 def disposable_ranges(scratch, arena, forwards):
     values = [scratch, arena.tensor]
+    from .dflash_speculative import PreparedDFlashRound, PreparedPrefill as DFlashPrefill
     for forward in forwards.values():
+        if isinstance(forward, (PreparedDFlashRound, DFlashPrefill)):
+            values.extend((forward.owner.buffers, forward.owner.layer_buffers, forward.owner.sampling_buffers))
+            if isinstance(forward, DFlashPrefill):
+                forward = forward.generation
+            else:
+                continue
         if isinstance(forward, PreparedPrefill):
             values.extend((forward.feedback, forward.previous, forward.before))
             values.extend(_draft_scratch(forward.absorb))

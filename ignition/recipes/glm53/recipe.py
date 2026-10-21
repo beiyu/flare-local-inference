@@ -1,6 +1,8 @@
 """Qualified checkpoint, serving range, and memory costs of the GLM 5.3 recipe."""
 
 from types import MappingProxyType
+from pathlib import Path
+import hashlib
 from dataclasses import replace
 import json
 import math
@@ -39,6 +41,10 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     speculation = plan.speculation
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width}
+    from .dflash_weights import DRAFT_DIRECTORY
+    draft_checkpoint = Path(snapshot) / DRAFT_DIRECTORY
+    if speculation is not None and draft_checkpoint.is_dir():
+        drafting["dflash_checkpoint"] = draft_checkpoint
     config = PreparationConfig(image_concurrency=plan.image_concurrency, compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, compile_decoder=compile_forwards, retain_graphs=retain_graphs,
@@ -168,4 +174,30 @@ def checkpoint_variant(snapshot, recipe, checkpoint):
     costs = MappingProxyType({2: RECIPE.plain_ranks[2]})
     variant = replace(recipe, checkpoints=(replacement,), ranks=costs, plain_ranks=MappingProxyType({}),
         speculation=None, max_draft_tokens=0, max_images=20, image_bytes=2048 * 4096 * 2)
+    from .dflash_weights import DRAFT_DIRECTORY, inspect_draft
+    draft_path = snapshot / DRAFT_DIRECTORY
+    if draft_path.is_dir():
+        draft_config, draft_manifest = inspect_draft(draft_path)
+        # QKV/output and MLP intermediates partition over TP2; other draft tensors replicate.
+        sharded = (".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight",
+                   ".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
+        draft_bytes = sum(t.nbytes // (2 if name.endswith(sharded) else 1)
+                          for name, t in draft_manifest.tensors.items())
+        # The fused context KV matrix retains a separate copy of each layer's K/V rows.
+        draft_bytes += 5 * 2 * 512 * 4096 * 2
+        identity = hashlib.sha256((draft_path / "config.json").read_bytes())
+        for shard in draft_manifest.shards:
+            identity.update(shard.header_sha256.encode())
+        replacement = replace(replacement,
+            stored_bytes=replacement.stored_bytes + sum(t.nbytes for t in draft_manifest.tensors.values()),
+            device_bytes=replacement.device_bytes + 2 * draft_bytes, draft_bytes=2 * draft_bytes,
+            revision=replacement.revision + "-dflash2-" + identity.hexdigest())
+        # Existing speculative target rows, less the integrated MTP's three state regions,
+        # plus five sharded BF16 draft KV windows. Every added region is 256-byte aligned.
+        state_bytes = RECIPE.ranks[2].state_row_bytes - (2 * 12 * 128 * 2 + _PAGE_LAYER_BYTES)
+        state_bytes += sum(math.prod(shape) * 2 for _, shape, _ in draft_config.regions(2))
+        speculative_costs = MappingProxyType({2: RankCosts(state_bytes, _TARGET_PAGE_LAYERS * _PAGE_LAYER_BYTES,
+            _GRAPH_BYTES + (512 << 20), page_tokens=512)})
+        variant = replace(variant, checkpoints=(replacement,), speculation=Speculation(draft_tokens=7),
+            max_draft_tokens=7, ranks=speculative_costs, plain_ranks=costs)
     return variant, replacement

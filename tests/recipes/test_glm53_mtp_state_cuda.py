@@ -22,16 +22,18 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned CUDA device")
 
 
+@pytest.mark.parametrize("world", [2, 4])
 @torch.no_grad()
-def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
+def test_learned_kda_verification_commits_each_prefix_before_plain_decode(world):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
     manifest = inspect_indexed_checkpoint(snapshot)
     module = create_model_tree(snapshot).model.language_model.layers[0].self_attn
-    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, 4),
-                         prefixes=(f"{TEXT_PREFIX}.layers.0.self_attn.",)) as loader:
+    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, world),
+                         prefixes=(f"{TEXT_PREFIX}.layers.0.self_attn.",),
+                         exl3_library=os.environ.get("FLARE_EXL3_LIBRARY")) as loader:
         weights = loader.load_attention(0)
-    pool = ContinuationPool.allocate(("linear_attention",), 4, 10, 1, "cuda:0", mtp=True)
+    pool = ContinuationPool.allocate(("linear_attention",), world, 10, 1, "cuda:0", mtp=True)
     state = pool.decoder.layers[0]
     arena = ScratchArena("cuda:0")
     metas = {width: DeltaMetadata.allocate(1, "cuda:0", verification_columns=8) for width in (1, 6)}
@@ -52,7 +54,7 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
         session.register_scratch(arena)
         for width in metas:
             operators[width] = PreparedGlmKDA(module, weights, sources[width],
-                KDAScratch.allocate(width, 16, "cuda:0"), state, metas[width],
+                KDAScratch.allocate(width, 64 // world, "cuda:0"), state, metas[width],
                 mode="decode", session=session, name=f"decode{width}", workspace=arena,
                 records=records.layer(0) if width > 1 else None)
         op.kda_commit = PreparedKDACommit(pool, records, operators[6].recurrent_plan,

@@ -99,7 +99,7 @@ class PreparedDecoder:
 
     def __init__(self, weights: ModelWeights, scratch: DecoderScratch, state: DecoderState,
                  metadata: DecoderMetadata, *, mode, runtime, vocabulary_runtime, coordinator, session, name,
-                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, vision=None, norm_kernels=None):
+                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, vision=None, norm_kernels=None, auxiliary_buffers=None):
         language = weights.tree.model.language_model
         if len(weights.layers) != 45 or len(language.layers) != 45 or len(state.layers) != 45:
             raise ValueError("GLM text execution requires all 45 decoder layers")
@@ -128,6 +128,13 @@ class PreparedDecoder:
             self.layers.append(layer)
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")
+        self.feedback_capture = None
+        self.auxiliary = None
+        if auxiliary_buffers is not None:
+            from .dflash import PreparedFeedback
+            self.feedback_capture = PreparedFeedback(weights.dflash2.config, self.layers, scratch,
+                session=session, name=name, buffers=auxiliary_buffers)
+            self.auxiliary = self.feedback_capture.auxiliary
         # Sparse-attention layers share index scratch, which no other layer overlays, and the same metadata,
         # so the first layer's pool lengths and page tables serve every later one.
         indexers = [layer.attention.indexer for layer in self.layers if hasattr(layer.attention, "indexer")]
@@ -150,8 +157,10 @@ class PreparedDecoder:
             self.vision.inject(self.metadata, embedding)
         s.residual.copy_(embedding[:, None, :])
         value = s.residual
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             value = layer(value)
+            if self.feedback_capture is not None:
+                self.feedback_capture(index, layer)
         if self.feedback is None:
             torch.index_select(s.residual, 0, self.metadata.sample_indices, out=s.selected_residual)
             collapsed = language.hc_head(s.selected_residual[:, None]).squeeze(1)

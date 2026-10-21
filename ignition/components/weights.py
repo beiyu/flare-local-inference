@@ -435,6 +435,38 @@ class DirectWeightLoader:
         self._copy(target, source)
         return target
 
+    def load_bf16_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
+        """Pack explicitly stored BF16 projection slices without quantization or conversion."""
+        import torch
+
+        prefixes = tuple(prefixes)
+        if not prefixes:
+            raise ValueError("BF16 projection group must be nonempty")
+        ranges = (None,) * len(prefixes) if row_ranges is None else tuple(row_ranges)
+        if len(ranges) != len(prefixes):
+            raise ValueError("BF16 projection ranges must match their source tensors")
+        tensors = []
+        for prefix, rows in zip(prefixes, ranges, strict=True):
+            name = prefix + ".weight"
+            metadata = self.manifest.tensors.get(name)
+            if metadata is None or metadata.dtype != "BF16" or len(metadata.shape) != 2:
+                raise ValueError(f"{name}: expected stored BF16 projection")
+            def extent(bounds, size):
+                if bounds is None:
+                    return slice(None)
+                first, last = bounds
+                if type(first) is not int or type(last) is not int or not 0 <= first < last <= size:
+                    raise ValueError(f"{name}: invalid BF16 projection extent")
+                return slice(first, last)
+            tensor = self.load_tensor(name, extent=(extent(rows, metadata.shape[0]),
+                extent(column_range, metadata.shape[1])))
+            if tensor.dtype != torch.bfloat16:
+                raise ValueError(f"{name}: loader changed checkpoint precision")
+            tensors.append(tensor)
+        if len({tensor.shape[1] for tensor in tensors}) != 1:
+            raise ValueError("fused BF16 projection input widths differ")
+        return tensors[0] if len(tensors) == 1 else torch.cat(tensors)
+
     def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
         """Pack compatible projection rows without changing their quantization."""
         self._require_open()

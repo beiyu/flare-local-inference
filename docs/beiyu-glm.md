@@ -5,10 +5,12 @@ reference: routed experts remain EXL3 K4 MCG, non-expert and vision weights reta
 their original precision, and the same BF16 donor `o_proj` tensors must be used.
 The upstream base is `47581ccac82660953a5b59cb04b2750d64edc97d`.
 
-The full TP2 package has exported successfully and passed fresh native loads on
-both Sparks. Native API acceptance and the text/image baseline comparisons have
-passed through native 9999 and NewAPI 8889, including explicit `stop_scope`
-forwarding. This does not establish complete vLLM or DFlash2 equivalence.
+The external DFlash2 TP2 package now runs natively on both Sparks, through
+native 9999 and NewAPI 8889. Text/image API, image-window/cache, long-prompt and
+unequal-tail concurrency workloads pass. A separate 64-token English comparison
+still differs from ordinary decode, so complete numerical equivalence and
+comparative performance remain unqualified. The earlier ordinary package and
+launch configuration are retained for restoration.
 
 ## Implemented boundaries
 
@@ -89,7 +91,7 @@ The completed component checks from this migration are:
 These component results have the scopes shown above. Complete-model service
 checks below provide separate export, reload and request evidence.
 
-## Complete-model service checks
+## Ordinary complete-model service checks
 
 TP2 compilation completed 19/19 forwards in 431.2 seconds. All 30 graphs passed
 measurement, warmup and capture. Export completed in 1070.4 seconds, and both
@@ -116,9 +118,90 @@ The final CLI and two-alias wrappers are deployed on both hosts, with
 `api-extended-final.json`. The native processes map no Python, Torch or EXL3
 preparation shared libraries.
 
-Exact short-request output and usage comparisons do not establish full-model
-numerical equality across workloads. DFlash2, video, the complete 65536-token
-output extent and comparative serving performance remain unverified.
+These ordinary-package short-request comparisons do not establish full-model
+numerical equality, DFlash2 behavior, video support, the complete 65536-token
+output extent or comparative serving performance.
+
+## External DFlash2 preparation
+
+A transplant checkpoint may contain a `dflash2/` companion directory, or a
+symlink to the local draft snapshot. The companion is the original BF16
+`incoai/GLM-5.3-Flash-DFlash2` revision
+`bf582e4eacc1810f76656d1811693ff6c6737d2a`. Each preparation rank reads its own
+local copy. Preflight checks its model geometry and all 81 tensor names, shapes
+and BF16 storage types before GPU loading. The target EXL3 experts, donor tensors,
+image processor and chat template retain the migration settings above.
+
+This companion selects the external seven-token drafter rather than the
+checkpoint-integrated MTP layer. Ignition captures target features after layers
+5, 14, 24, 33 and 42, contracts each mHC output in FP32, and projects their
+concatenation into the draft context. The five draft layers use independent
+2048-token circular BF16 KV windows, noncausal eight-token blocks, grouped
+convolutions and the checkpoint's conditional top-16 candidate selector. Target
+embedding and output-head weights are shared; draft projections remain BF16.
+
+Proposal filtering, stochastic verification and request-local RNG use the shared
+speculative components. Accepted tokens commit the target's KDA, convolution and
+index histories and only their target features enter the draft windows. All ten
+draft KV regions belong to the complete continuation row, including prefix
+snapshots and restores. Width-one rounds use ordinary target decode and still
+update draft context. Target decode context parallelism retains its own page
+geometry; it does not shard or reinterpret the draft's circular window positions.
+No graph operation contract, package schema or Rust model algorithm is added.
+
+For the checked TP2 geometry, a complete continuation row is 102286336 bytes.
+The draft's aggregate device weight cost is 2838828032 bytes, including replicated
+weights and the additional fused context-KV projection. `--no-mtp` prepares an
+ordinary package without the companion. Omitted native speculation flags use
+the prepared package defaults; `--mtp-draft-tokens 0` selects its ordinary graphs.
+The task launcher no longer forces that override.
+
+Component qualification passed 15 CPU cases and two actual-checkpoint SM121
+checks. These cover exact accepted-window writes, wraparound and inactive rows,
+attention against an independent SDPA reference, complete draft compilation and
+native CUDA replay with unchanged allocation/free counters. The reference RoPE
+uses the deployed implementation's inverse-frequency operation order. The
+complete-model results below qualify the deployed path separately; these component
+checks alone do not establish full target numerical equivalence. The actual EXL3
+TP2 KDA layer also passed its existing verification-output and accepted-prefix
+state comparisons against ordinary decode, with unchanged numerical bounds.
+This remains a single-layer check; full-model equivalence is open.
+
+### Native deployment and remaining numerical qualification
+
+The new signed export ID is `7f45808e35824cdfb52e7b5db0cff19b`. Distributed forward
+compilation took 845.7 seconds; rank zero completed 32/32 assigned jobs. Each rank
+loaded and warmed 48 compiled forwards and captured all 66 serving graphs.
+Export took 1152.4 seconds; both preparation processes exited zero. Both source compatibility identities match
+the package, and the local Ignition sources match the prepared sources.
+
+Both hosts passed fresh native loads with `--verify-weights`, first using the
+new package's ordinary graphs and then its default adaptive DFlash2 graphs.
+The unchanged trusted publisher key and native binary are used. A controlled
+four-request run offered 207 drafts and accepted 161: speculative work actually
+executed after package reload. No Python or preparation library is needed for
+serving.
+
+| Workload with DFlash2 enabled | Observed result |
+| --- | --- |
+| Native and NewAPI acceptance | All 38 checks passed; original text/image answers and accounting match, including SSE, tool calls, stop scopes, cancellation, concurrency and 20/21-image policy |
+| Extended image/cache and long prompts | All 10 passed: AA/AB/AA image-content isolation, 4096 image tokens across a 4096-token prefill boundary, and repeated 4321-token text prompts through both endpoints |
+| Four concurrent public requests with unequal tails | 64/47/31/19 output-token limits; all four normalized responses matched their sequential DFlash2 results exactly |
+| Separate ordinary versus DFlash2 comparison | Failed exact equality: two Chinese-request runs matched, while both repetitions of one English request diverged at generated token index 41; usage and finish reasons matched |
+
+The failed comparison remains in `dflash2-speculative-public.json`, alongside
+`dflash2-ordinary-public.json`, under `/workspace/outputs/flare-beiyu` on spark-01.
+A subsequent native logprob probe selected the ordinary token at that position
+and diverged later; its top-two logprob gap was 0.125, versus 0.5 for a forced
+common-prefix probe. This does not establish a cause or an acceptable full-model
+error bound. Do not turn the recorded timings into a speedup or equivalence claim.
+Full GLM target verification/state numerical qualification remains open in
+`TODO.txt`; none of the failed checks or their reference outputs were relaxed.
+
+The completed API and extended results are `api-acceptance-dflash2.json`,
+`api-extended-dflash2.json` and `dflash2-concurrent-public.json` in that directory.
+These remain selected workloads, not proof of complete vLLM parity, video support
+or the entire 65536-token output extent.
 
 ## EXL3 GPU qualification
 
@@ -221,8 +304,9 @@ norm-vector checks do not qualify the complete mHC operation or text decoder.
 
 ## Remaining migration work
 
-See `TODO.txt` for the remaining DFlash2, video and performance work. The
-independent donor/template checkpoint, EXL3/BF16 execution, fresh native loads,
+See `TODO.txt` for full-model DFlash2 numerical qualification, video and performance
+work.
+The independent donor/template checkpoint, EXL3/BF16 execution, fresh native loads,
 image-window restore and native API checks have passed the workloads above.
 NewAPI explicit stop-scope forwarding passed the final acceptance suite. Full-model
 numerical equality and the full 65536-token output extent require separate checks.
@@ -254,14 +338,14 @@ TP2/image capacities. The vision directory's `manifest.json`, `rms.cubin` and
 `qk.cubin` are preparation inputs; their relative paths and contents enter the
 package cache identity. BF16 EXL3 text-only preparation also requires this
 directory for exact RMSNorm; the existing text-only NVFP4 path does not read it.
-Native serving uses the exported kernels. The EXL3 checkpoint variant already
-excludes drafts; omit `--no-mtp`,
-which applies only to recipes that declare a learned drafter. Keep checkpoint precision; do not select online activation
-or weight conversion to fit memory. Preparation must qualify full target prefill,
-decode, cross-host caches, image encode/project/injection and package reload.
-The initial ordinary decode path is not DFlash2: the old service uses its external
-7-token DFlash2 drafter, while this export excludes learned drafts. Do not claim
-speculation or throughput parity from a successful ordinary decode request.
+Native serving uses the exported kernels. A transplant checkpoint without a
+`dflash2/` companion prepares ordinary decode; the companion described above
+selects the external seven-token drafter. Use `--no-mtp` to explicitly prepare
+ordinary graphs when a companion is present. Keep checkpoint precision; do not
+select online activation or weight conversion to fit memory. Preparation must
+qualify full target prefill, decode, cross-host caches, image delivery and reload.
+A successful ordinary decode request does not establish speculative behavior or
+throughput parity.
 
 After exporting and verifying the package on both hosts, the entrypoint runs
 only the native executable. Select rank 0 on spark-01 and rank 1 on spark-03;
@@ -395,3 +479,26 @@ drain path. The units use `Restart=on-failure`; they do not coordinate recovery
 across hosts. If one rank fails, stop both and restart the pair after checking the
 failure. Keep the package arguments, public profile and launch scripts consistent
 on both hosts. This setup does not establish a reboot or cross-host failover test.
+
+
+### Current DFlash2 service package
+
+Both user services now select
+`/workspace/outputs/flare-beiyu/glm53-exl3-dflash2-tp2-20261021/model.safetensors`.
+The same signed primary and unchanged public publisher profile were verified on
+both hosts. Rank 1's five final files totaled 89828060829 physical bytes and
+transferred directly over the dedicated fabric. The final-file hashes differed
+from its local preparation blobs; those blobs were checked rather than silently
+reused. The transfer listener has stopped, and both preparation containers are
+stopped. Preparation itself read authenticated local checkpoint files on both
+Sparks, with no remote tensor payloads on rank 1.
+
+The launch wrapper follows package defaults: adaptive DFlash2 up to seven drafts.
+For an ordinary comparison, append `--mtp-draft-tokens 0`. Startup retains full
+stored-data verification. Before replacement, task-local launchers and deployment
+metadata were saved as `*.before-dflash2` under
+`/workspace/runtime/flare-beiyu/service/`. The earlier ordinary package above
+remains intact. Restore a pair together: stop both units, restore the three saved
+`start-native.sh`, `spark_glm_service.sh` and `native-deployment.json` files, then
+start both units and check native health plus the authenticated NewAPI request.
+The numerical limitation above applies to the currently enabled DFlash2 path.

@@ -61,10 +61,11 @@ class ModelWeights:
     allocated_bytes: int
     mtp: MTPWeights | None = None
     exl3_workspace: object | None = None
+    dflash2: object | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=False, expert_activation="a4",
-             expand_expert_scales=False, exl3_library=None, exl3_prefill_library=None, exl3_prefill_capacity=4096):
+             expand_expert_scales=False, exl3_library=None, exl3_prefill_library=None, exl3_prefill_capacity=4096, dflash_checkpoint=None):
         import torch
 
         from .model import create_model_tree
@@ -103,9 +104,13 @@ class ModelWeights:
                 from ignition.components.vocabulary import nvfp4_draft_head
 
                 draft = replace(draft, draft_head=nvfp4_draft_head(tree.lm_head.weight))
+        dflash = None
+        if dflash_checkpoint is not None:
+            from .dflash_weights import DraftWeights
+            dflash = DraftWeights.load(dflash_checkpoint, device, shard, progress=progress if shard.rank == 0 else None)
         torch.cuda.synchronize(device)
         return cls(tree, shard, tuple(layers), scales, torch.cuda.memory_allocated(device) - before, draft,
-                   loader.exl3_workspace)
+                   loader.exl3_workspace, dflash)
 
 
 class GlmWeightLoader(DirectWeightLoader):
@@ -169,35 +174,7 @@ class GlmWeightLoader(DirectWeightLoader):
     def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
         if not self.is_exl3:
             return super().load_linear_group(prefixes, row_ranges=row_ranges, column_range=column_range)
-        import torch
-
-        prefixes = tuple(prefixes)
-        if not prefixes:
-            raise ValueError("GLM projection group must be nonempty")
-        ranges = (None,) * len(prefixes) if row_ranges is None else tuple(row_ranges)
-        if len(ranges) != len(prefixes):
-            raise ValueError("GLM projection ranges must match their source tensors")
-        tensors = []
-        for prefix, rows in zip(prefixes, ranges, strict=True):
-            name = prefix + ".weight"
-            metadata = self.manifest.tensors.get(name)
-            if metadata is None or metadata.dtype != "BF16" or len(metadata.shape) != 2:
-                raise ValueError(f"{name}: routed-only EXL3 requires stored BF16 non-routed projections")
-            def extent(bounds, size):
-                if bounds is None:
-                    return slice(None)
-                first, last = bounds
-                if type(first) is not int or type(last) is not int or not 0 <= first < last <= size:
-                    raise ValueError(f"{name}: invalid BF16 projection extent")
-                return slice(first, last)
-            tensor = self.load_tensor(name, extent=(extent(rows, metadata.shape[0]),
-                extent(column_range, metadata.shape[1])))
-            if tensor.dtype != torch.bfloat16:
-                raise ValueError(f"{name}: loader changed checkpoint precision")
-            tensors.append(tensor)
-        if len({tensor.shape[1] for tensor in tensors}) != 1:
-            raise ValueError("fused BF16 projection input widths differ")
-        return tensors[0] if len(tensors) == 1 else torch.cat(tensors)
+        return self.load_bf16_linear_group(prefixes, row_ranges=row_ranges, column_range=column_range)
 
     def load_attention(self, layer):
         prefix = self._layer(layer) + ".self_attn"

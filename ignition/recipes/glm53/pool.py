@@ -12,23 +12,24 @@ from .mla import MLAState
 from .state import DecoderState
 
 
-def continuation_layout(layer_types, world_size, *, mtp=False):
+def continuation_layout(layer_types, world_size, *, mtp=False, dflash2=None):
     if world_size not in (1, 2, 4):
         raise ValueError("GLM continuation storage requires one, two or four ranks")
     layer_types = tuple(layer_types)
     if not layer_types:
         raise ValueError("GLM continuation storage requires attention layers")
     heads = 64 // world_size
+    speculating = mtp or dflash2 is not None
     regions = []
     for index, kind in enumerate(layer_types):
         if kind == "linear_attention":
             regions.extend((
                 (f"layer{index}.recurrent", (heads, 128, 128), torch.float32),
-                (f"layer{index}.convolution", (3 * heads * 128, 10 if mtp else 3), torch.bfloat16),
+                (f"layer{index}.convolution", (3 * heads * 128, 10 if speculating else 3), torch.bfloat16),
             ))
         elif kind == "indexed_attention":
             regions.extend((
-                (f"layer{index}.index_tail", (2, 12 if mtp else 4, 128), torch.bfloat16),
+                (f"layer{index}.index_tail", (2, 12 if speculating else 4, 128), torch.bfloat16),
                 (f"layer{index}.latent_page", (4, 64, 528), torch.uint8),
                 (f"layer{index}.index_page", (64, 132), torch.uint8),
             ))
@@ -38,6 +39,8 @@ def continuation_layout(layer_types, world_size, *, mtp=False):
         regions.extend((("draft.index_tail", (2, 12, 128), torch.bfloat16),
                         ("draft.latent_page", (4, 64, 528), torch.uint8),
                         ("draft.index_page", (64, 132), torch.uint8)))
+    if dflash2 is not None:
+        regions.extend((name, shape, torch.bfloat16) for name, shape, _ in dflash2.regions(world_size))
     regions.extend((("last_hidden", (4096,), torch.bfloat16), ("consumed_tokens", (1,), torch.int64)))
     return StateLayout.from_specs(regions)
 
@@ -58,14 +61,14 @@ class ContinuationPool(StateStorage):
 
     @classmethod
     def allocate(cls, layer_types, world_size, slots, pages, device, *, mtp=False, storage=None, maximum_pages=None,
-                 context_ranks=1, virtual=None):
+                 context_ranks=1, virtual=None, dflash2=None):
         """`storage` places everything in a package; `virtual`, an in-process VirtualStorage, holds
         only the KV pages. Either gives each page pool `maximum_pages` of shape and backs `pages`."""
         layer_types = tuple(layer_types)
         if type(pages) is not int or pages <= 0:
             raise ValueError("GLM continuation storage requires positive page capacity")
         package_storage = storage
-        storage = StateStorage.allocate(continuation_layout(layer_types, world_size, mtp=mtp), slots, device, storage=storage)
+        storage = StateStorage.allocate(continuation_layout(layer_types, world_size, mtp=mtp, dflash2=dflash2), slots, device, storage=storage)
         page_storage = package_storage if package_storage is not None else virtual
         maximum = pages if page_storage is None else maximum_pages
         if maximum is None or maximum < pages:

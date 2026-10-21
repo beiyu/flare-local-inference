@@ -230,7 +230,8 @@ class PreparedRound:
                                     name=self.name, buffers=self.broadcast_buffers)
         commit = PreparedSpeculativeCommit(o.requests, verify.output, self.candidates,
             o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows,
-            o.completion, o.frame, o.sequence, logits=self.decoder.scratch.logits.view(b, w, -1), rng=o.rng, token_limits=o.inputs.query_lengths[:b])
+            o.completion, o.frame, o.sequence, logits=self.decoder.scratch.logits.view(b, w, -1), rng=o.rng, token_limits=o.inputs.query_lengths[:b],
+            draft_context_lag=getattr(o, "draft_context_lag", 1))
         commit.prepare()
         self.operations = target, proposals, verify, commit
 
@@ -254,7 +255,7 @@ class PreparedRound:
         g.fresh.zero_()
         g.accepted_tokens.fill_(1)
         # Verification reads each request's live row in column zero and records its tokens.
-        states = torch.where(self.state_columns < 1, states, 0)
+        states = torch.where(self.state_columns < 1, states[:, :self.state_columns.numel()], 0)
         g.state_indices.copy_(torch.where(self.active[:, None], states, 0))
         g.num_seqs.copy_(o.inputs.live_rows.clamp(0, b))
         g.num_tokens.copy_(ends[-1:])
@@ -292,9 +293,8 @@ class PreparedRound:
         save_hidden(selected_hidden, o.pool.last_hidden,
                     live, (counts > 0).int())
 
-    def __call__(self):
+    def begin_round(self):
         o, b, w = self.owner, self.batch, self.width
-        target, proposals, verify, commit = self.operations
         slots = o.inputs.row_slot_ids[:b].long()
         safe = slots.clamp(0, o.requests.capacity - 1)
         limits = o.inputs.query_lengths[:b]
@@ -311,6 +311,12 @@ class PreparedRound:
         self.active.copy_(self.validator.token_state.active.bool())
         self.before.copy_(o.requests.consumed_tokens[safe])
         self.pending.copy_(o.requests.pending_token[safe])
+        return slots, safe, limits
+
+    def __call__(self):
+        o, b, w = self.owner, self.batch, self.width
+        target, proposals, verify, commit = self.operations
+        slots, safe, limits = self.begin_round()
         gather_rows(o.pool.last_hidden, o.inputs.request_state_rows[safe, 0], self.previous)
         gather_rows(o.pool.draft.index.tail, o.inputs.request_state_rows[safe, 0], self.tail_backup)
         self.base_offset.copy_(torch.where(o.draft_generation[safe] == o.requests.generation[safe], o.draft_offset[safe], 0))

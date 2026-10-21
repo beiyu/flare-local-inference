@@ -85,6 +85,7 @@ class PreparationConfig:
     retain_graphs: bool = False
     kernel_cache: Path | None = None
     mtp: bool = False
+    dflash_checkpoint: Path | None = None
     # Routed NVFP4-CSF experts: A16 activations with A4 prefill launches, or A4 throughout.
     expert_activation: str = "a16"
     # Shard latent records and C4 pools across the tensor-parallel ranks (decode context parallelism).
@@ -107,6 +108,10 @@ class PreparationConfig:
         if type(self.mtp) is not bool:
             raise TypeError("mtp must be a boolean")
         self.speculative_shapes
+        if self.dflash_checkpoint is not None and not self.mtp:
+            raise ValueError("DFlash2 requires enabled speculation")
+        if self.dflash_checkpoint is not None and max(self.speculative_widths) > 8:
+            raise ValueError("DFlash2 supports at most seven draft tokens")
         if self.speculative_fixed_width is not None and (
                 type(self.speculative_fixed_width) is not int
                 or self.speculative_fixed_width not in self.speculative_widths):
@@ -258,7 +263,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     transient = contextlib.ExitStack()
     if package_storage is not None:
         transient.enter_context(package_storage.transient())
-    weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, mtp=config.mtp,
+    weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, mtp=config.mtp and config.dflash_checkpoint is None,
+                                dflash_checkpoint=config.dflash_checkpoint,
                                 expert_activation=config.expert_activation,
                                 expand_expert_scales=config.expand_expert_scales, exl3_library=config.exl3_library,
                                 exl3_prefill_library=config.exl3_prefill_library,
@@ -276,7 +282,9 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     memory("after weights")
     with phase(progress, "Allocate model state and collectives") as stage:
         layer_types = weights.tree.config.text_config.layer_types
-        layout = continuation_layout(layer_types, shard.world_size, mtp=config.mtp)
+        dflash = None if weights.dflash2 is None else weights.dflash2.config
+        integrated_mtp = config.mtp and dflash is None
+        layout = continuation_layout(layer_types, shard.world_size, mtp=integrated_mtp, dflash2=dflash)
         # Native loading sizes a package's continuation rows and KV pages from the serving host's
         # memory, within their virtual extents. A package backs only what its tuning and capture use.
         snapshots = 1 if package_storage is not None else layout.snapshot_capacity(config.snapshot_budget_bytes)
@@ -286,7 +294,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         slots = config.request_capacity
         # Speculative verification records its tokens and commits into the live row: one row per request.
         state_rows = snapshots + slots
-        page_bytes = (layer_types.count("indexed_attention") + int(config.mtp)) * (4 * 64 * 528 + 64 * 132)
+        page_bytes = (layer_types.count("indexed_attention") + int(integrated_mtp)) * (4 * 64 * 528 + 64 * 132)
         max_cache_pages = minimum_across_ranks(torch.cuda.mem_get_info(device)[1] // page_bytes, group)
         context_ranks = shard.world_size if config.context_parallel and group is not None else 1
         # Compiled forwards bind the page pools' shapes. Give in-process pools a package's
@@ -298,7 +306,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
 
             virtual_pages = VirtualStorage(device)
         pool = ContinuationPool.allocate(layer_types, shard.world_size,
-            state_rows + 1, pages, device, mtp=config.mtp, storage=package_storage,
+            state_rows + 1, pages, device, mtp=integrated_mtp, dflash2=dflash, storage=package_storage,
             maximum_pages=max_cache_pages, context_ranks=context_ranks, virtual=virtual_pages)
         requests = DeviceRequestState.allocate(device, vocab_size=154880, capacity=slots)
         inputs = BatchInputs.allocate(config.prefill_chunk_size, blocks, device, capacity=slots)
@@ -318,12 +326,13 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         ipc = None if package_storage is None else package_storage.peer_storage
         collective = prefill_collective = vocabulary_collective = None
         sample_rows = max(b * w for b, w in config.speculative_shapes) if config.mtp else config.request_capacity
+        vocabulary_rows = max(sample_rows, config.request_capacity * dflash.block_size if dflash is not None else 0)
         if coordinator is not None and coordinator.spans_hosts:
             # Ranks on separate Sparks reduce and gather through one RoCEnante runtime, which also
             # carries decode context parallelism's exchanges.
             # Decode rows reduce one-shot; prefill chunks through the pipelined two-shot path.
-            decode_tokens = max(config.request_capacity, sample_rows)
-            gather_bytes = sample_rows * (154880 // shard.world_size) * 2
+            decode_tokens = max(config.request_capacity, vocabulary_rows)
+            gather_bytes = vocabulary_rows * (154880 // shard.world_size) * 2
             if config.context_parallel:
                 from ignition.components.head_exchange import pack_width
 
@@ -350,9 +359,15 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
                                                                hidden_size=4096, ipc=ipc)
             vocabulary_collective = create_all_gather_runtime(group, device,
-                max_rows=sample_rows, columns=154880, ipc=ipc)
+                max_rows=vocabulary_rows, columns=154880, ipc=ipc)
+        draft_identity = None
+        if dflash is not None:
+            from .dflash_weights import inspect_draft
+            draft_identity = dict(config=vars(dflash),
+                headers=[s.header_sha256 for s in inspect_draft(config.dflash_checkpoint)[1].shards])
         identity = hashlib.sha256(json.dumps({"config": json.loads((snapshot / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
+            "draft": draft_identity,
             "contract": "glm5next.graph-inputs.v2"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, tuning_replica=config.tuning_replica,
@@ -410,7 +425,13 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             prefill_storage, decoder_storage, vision_primary = overlay(
                 (prefill_storage, decoder_storage, vision_primary), keep=(IndexScratch, RouterScratch))
         speculation = None
-        if config.mtp:
+        if config.mtp and dflash is not None:
+            from .dflash_speculative import SpeculativePreparation
+            speculation = SpeculativePreparation(weights, pool, requests, inputs, decoder_storage,
+                session=session, workspace=arena, completion=completion, frame=frame, sequence=sequence,
+                runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
+                max_cache_pages=max_cache_pages, context=context, norm_kernels=vision_kernels)
+        elif config.mtp:
             from .speculative import SpeculativePreparation
 
             speculation = SpeculativePreparation(weights, pool, requests, inputs, decoder_storage, prefill_storage,
@@ -441,20 +462,24 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     metadata[name] = DecoderMetadata.allocate(capacity, rows, blocks, device)
                     storage = prefill_storage if mode == "prefill" else decoder_storage
                     scratch[name] = storage.rows(capacity, mode, sample_rows=rows)
-                    feedback = torch.empty((capacity, 4096), dtype=torch.bfloat16, device=device) if enabled else None
+                    feedback = torch.empty((capacity, 4096), dtype=torch.bfloat16, device=device) if enabled and dflash is None else None
+                    auxiliary_buffers = speculation.buffers.cursor() if enabled and dflash is not None else None
                     decoders[name] = PreparedDecoder(weights, scratch[name], pool.decoder, metadata[name], mode=mode,
                         runtime=prefill_collective if mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS else collective,
                         vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
                         session=session, name=name, workspace=arena, feedback=feedback,
                         max_cache_pages=max_cache_pages, context=context,
                         vision=vision_state if mode == "prefill" else None,
-                        norm_kernels=vision_kernels if native_bf16 else None)
+                        norm_kernels=vision_kernels if native_bf16 else None, auxiliary_buffers=auxiliary_buffers)
                     batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard,
                                           pages=pool.memory_capacity[1:], shards=shards,
                                           validate_prefill=vision_state.validate_prefill if mode == "prefill" and vision_state is not None else None)
                     forward = PreparedGeneration(decoders[name], batch, completion, frame, sequence,
                         pool=pool, runtime=collective, coordinator=coordinator, session=session, name=f"{name}.generation", replicated_sampling=enabled)
-                    if enabled:
+                    if enabled and dflash is not None:
+                        from .dflash_speculative import PreparedPrefill
+                        forward = PreparedPrefill(speculation, forward, name, auxiliary_buffers)
+                    elif enabled:
                         from .speculative import PreparedPrefill
 
                         forward = PreparedPrefill(speculation, forward, feedback, name)
@@ -470,7 +495,10 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             vision_owners.append(forward)
             add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
         if speculation is not None:
-            from .speculative import PreparedRound
+            if dflash is None:
+                from .speculative import PreparedRound
+            else:
+                from .dflash_speculative import PreparedDFlashRound as PreparedRound
 
             for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
                 name = f"speculative{batch}x{width}"
@@ -492,10 +520,10 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     operation = PreparedMaintenance(mode, requests, pool, commands, inputs, completion, frame, sequence,
                         runtime=collective, coordinator=coordinator, session=session, name=name,
                         capacity=capacity, admission_buffers=admission,
-                        draft_tables=speculation.draft_tables if enabled else None,
+                        draft_tables=speculation.draft_tables if enabled and dflash is None else None,
                         page_tokens=config.page_tokens)
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
-                    add(name, operation, mode, capacity, 1, (*fields, "page_tables", *(("draft_page_tables",) if enabled else ()), *commands.buffers()), enabled=enabled)
+                    add(name, operation, mode, capacity, 1, (*fields, "page_tables", *(("draft_page_tables",) if enabled and dflash is None else ()), *commands.buffers()), enabled=enabled)
     memory(f"after graph catalog (operator scratch {arena.nbytes >> 20} MiB)")
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
@@ -619,7 +647,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         "prefill_chunk_size": config.prefill_chunk_size, "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": config.page_tokens,
         "frontend": prepare_frontend(snapshot, eos_token_ids=generation["eos_token_id"], image_profile="glm" if vision_weights is not None else None),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
-        "model_contract": prepare_contract(signatures, buffers, pool, page_tokens=config.page_tokens, draft_lag=1 if config.mtp else None, image_slots=config.image_concurrency, regions=cache_regions)}
+        "model_contract": prepare_contract(signatures, buffers, pool, page_tokens=config.page_tokens, draft_lag=(0 if dflash is not None else 1) if config.mtp else None, image_slots=config.image_concurrency, regions=cache_regions)}
     # Preserve the deployment's explicit 2048-token image budget, rather than the
     # checkpoint processor's broader default. It is part of this prepared graph catalog.
     if vision_weights is not None:
