@@ -4,7 +4,7 @@
     failed comparison; no performance claim yet. Native argmax checks pass;
     width-sensitive mHC arithmetic reproduces in captured component graphs.
     Trace the first full-model divergence from identical initial state.
-    See beiyu-glm.md#native-deployment-and-remaining-numerical-qualification.
+    See glm53-dflash2-output-divergence.md.
 
 [ ] Add GLM video input preprocessing, timestamp/frame-token layout and native
     feature delivery; the current deployment accepts still images only.

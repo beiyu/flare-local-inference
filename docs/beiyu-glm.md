@@ -205,6 +205,9 @@ or the entire 65536-token output extent.
 
 ### Width-sensitive target arithmetic investigation
 
+The Chinese [GLM DFlash2 output divergence issue](glm53-dflash2-output-divergence.md)
+tracks reproduction, measured evidence, limitations and the remaining investigation.
+
 A further isolated native probe made 16 requests using the retained public
 workload, zero temperature and seed 1234. Depending on the adaptive verification
 rounds, 64-token continuations matched ordinary decode or first differed at
