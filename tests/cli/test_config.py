@@ -151,3 +151,44 @@ def test_shard_size_uses_binary_units_and_flags_override_configuration(tmp_path)
     assert config.shard_size('16M') == 16 << 20
     with pytest.raises(UsageError, match='shard size'):
         load(tmp_path, '[publishing]\nshard_size = "-1G"\n')
+
+
+def test_default_string_stop_scope_is_explicit_and_validated(tmp_path):
+    assert load(tmp_path, "").get("server.default_stop_scope") == Setting("all", "default")
+    configured = load(tmp_path, '[server]\ndefault_stop_scope = "after_reasoning"\n')
+    assert configured.get("server.default_stop_scope") == Setting("after_reasoning", "[server]")
+    assert configured.get("server.default_stop_scope", "all") == Setting("all", "flag")
+    for scope in ("answer", "ALL", ""):
+        with pytest.raises(UsageError, match="default_stop_scope"):
+            load(tmp_path, f'[server]\ndefault_stop_scope = "{scope}"\n')
+
+
+def test_default_output_limit_is_optional_and_request_default_only(tmp_path):
+    assert load(tmp_path, "").get("server.default_max_new_tokens").value is None
+    configured = load(tmp_path, '[server]\ndefault_max_new_tokens = 65536\n')
+    assert configured.get("server.default_max_new_tokens") == Setting(65536, "[server]")
+    assert configured.get("server.default_max_new_tokens", 8) == Setting(8, "flag")
+    for value in (0, -1, 2**31):
+        with pytest.raises(UsageError, match="default_max_new_tokens"):
+            load(tmp_path, f"[server]\ndefault_max_new_tokens = {value}\n")
+
+
+def test_exl3_preparation_library_is_explicit_resolved_and_must_exist(tmp_path):
+    from ignition.cli.preparation import preparation_library
+    assert preparation_library(None) is None
+    library = tmp_path / "cooperative.so"; library.write_bytes(b"prepared library")
+    assert preparation_library(library) == library.resolve()
+    with pytest.raises(UsageError, match="existing preparation library"):
+        preparation_library(tmp_path / "missing.so")
+
+
+def test_vision_preparation_directory_is_explicit_resolved_and_must_be_directory(tmp_path):
+    from ignition.cli.preparation import preparation_directory
+    assert preparation_directory(None) is None
+    directory = tmp_path / "vision"; directory.mkdir()
+    assert preparation_directory(directory / ".." / "vision") == directory.resolve()
+    with pytest.raises(UsageError, match="existing preparation directory"):
+        preparation_directory(tmp_path / "missing")
+    library = tmp_path / "kernel.cubin"; library.write_bytes(b"not a directory")
+    with pytest.raises(UsageError, match="existing preparation directory"):
+        preparation_directory(library)

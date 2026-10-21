@@ -282,7 +282,11 @@ impl Bootstrap {
                 frontend_settings
                     .image
                     .ok_or("vision requires prepared image settings")?,
-                image_limits(&model.contract.vision, model.limits.max_sequence_tokens)?,
+                limit_image_count(
+                    image_limits(&model.contract.vision, model.limits.max_sequence_tokens)?,
+                    usize::try_from(integer("max_images_per_prompt", Some(model.limits.max_sequence_tokens as u64))?)
+                        .map_err(|_| "image count limit exceeds usize")?,
+                )?,
             )?)
         } else {
             if frontend_settings.image.is_some() {
@@ -313,6 +317,11 @@ impl Bootstrap {
             },
             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
             served_names,
+            default_stop_scope: match object.get("default_stop_scope") {
+                None | Some(Value::Null) => super::StringStopScope::All,
+                Some(value) => serde_json::from_value(value.clone())
+                    .map_err(|_| "default_stop_scope must be all or after_reasoning")?,
+            },
             context_hint: optional_text("context_hint")?,
             capacity_hint: optional_text("capacity_hint")?,
             bind: object
@@ -365,6 +374,14 @@ impl Bootstrap {
             server,
         })
     }
+}
+
+fn limit_image_count(mut limits: ImageLimits, maximum: usize) -> Result<ImageLimits> {
+    if maximum == 0 {
+        return Err("max_images_per_prompt must be positive".into());
+    }
+    limits.max_images = limits.max_images.min(maximum);
+    Ok(limits)
 }
 
 pub(crate) fn image_limits(vision: &crate::model::VisionCapabilities, context_tokens: usize) -> Result<ImageLimits> {
@@ -430,6 +447,24 @@ mod tests {
                 assert!(geometry.is_err());
             }
         }
+    }
+
+    #[test]
+    fn serving_image_count_limit_keeps_sequential_feature_windows() {
+        use crate::frontend::images::{GlmImageSettings, ImageSettings, RgbImage};
+        let vision = VisionCapabilities { feature_slots: 1, features_per_request: 2048,
+            max_images: 1, patches_per_feature: 4, patch_capacities: vec![256, 1024, 4096, 8192] };
+        let original = image_limits(&vision, 65536).unwrap();
+        let settings = ImageSettings::Glm(GlmImageSettings {
+            min_image_tokens: 16, max_image_tokens: 2048, patch_expand_factor: 1 });
+        let processor = ImageProcessor::load(settings, limit_image_count(original, 20).unwrap()).unwrap();
+        let images = (0..21).map(|_| RgbImage::new(112, 112, vec![128; 112 * 112 * 3]).unwrap()).collect::<Vec<_>>();
+        assert!(processor.process(&images[..20]).is_ok());
+        assert!(processor.process(&images).is_err());
+        assert_eq!(processor.limits().max_patches_per_image, original.max_patches_per_image);
+        assert_eq!(processor.limits().max_total_patches, original.max_total_patches);
+        assert_eq!(limit_image_count(original, usize::MAX).unwrap().max_images, 65536);
+        assert!(limit_image_count(original, 0).is_err());
     }
 
     #[test]
@@ -539,6 +574,17 @@ mod tests {
         legacy["assets"]["chat_template"] = template_asset.clone();
         let loaded = Bootstrap::load(&legacy.to_string(), &manifest).unwrap();
         assert_eq!(loaded.frontend.prompt_encoder(), PromptEncoder::Jinja);
+        assert_eq!(loaded.server.default_stop_scope, super::super::StringStopScope::All);
+        for (value, expected) in [
+            (Value::Null, super::super::StringStopScope::All),
+            (json!("all"), super::super::StringStopScope::All),
+            (json!("after_reasoning"), super::super::StringStopScope::AfterReasoning),
+        ] {
+            let mut configured = legacy.clone(); configured["default_stop_scope"] = value;
+            assert_eq!(Bootstrap::load(&configured.to_string(), &manifest).unwrap().server.default_stop_scope, expected);
+        }
+        let mut invalid = legacy.clone(); invalid["default_stop_scope"] = json!("invalid");
+        assert!(Bootstrap::load(&invalid.to_string(), &manifest).is_err());
         assert_eq!(
             loaded.model.sampling_ranges,
             crate::model::SamplingRanges::default()

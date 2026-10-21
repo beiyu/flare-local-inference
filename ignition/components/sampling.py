@@ -51,8 +51,8 @@ class RequestAdmission:
                 raise ValueError(f"{name} must be finite FP32")
             if name in ("temperature", "top_p", "repetition_penalty") and 0 < value < torch.finfo(torch.float32).tiny:
                 raise ValueError(f"{name} must be a positive normal FP32 value")
-        if self.temperature <= 0 or not 0 < self.top_p <= 1 or not 0 <= self.min_p <= 1 or self.repetition_penalty <= 0:
-            raise ValueError("require temperature > 0, 0 < top_p <= 1, 0 <= min_p <= 1 and repetition_penalty > 0")
+        if self.temperature < 0 or not 0 < self.top_p <= 1 or not 0 <= self.min_p <= 1 or self.repetition_penalty <= 0:
+            raise ValueError("require temperature >= 0, 0 < top_p <= 1, 0 <= min_p <= 1 and repetition_penalty > 0")
         if len(self.eos_token_ids) > EOS_CAPACITY or any(type(x) is not int or not 0 <= x < vocab_size for x in self.eos_token_ids):
             raise ValueError(f"EOS requires at most {EOS_CAPACITY} vocabulary token IDs")
 
@@ -267,22 +267,24 @@ def _scores(Logits, Scores, Slots, Epochs, Live, Generation, Status, Counts, Par
         x = x - frequency * counts
         bits = tl.load(Grammar + slot * WORDS + token // 32, valid & (token < V), other=0).to(tl.uint32)
         allowed = (enabled == 0) | ((bits >> (token % 32)) & 1 != 0)
-    x = x / tl.where(valid, temperature, 1.)
+    x = x / tl.where(valid & (temperature > 0.), temperature, 1.)
     tl.store(Scores + row * V + token, tl.where(valid & allowed, x, -float("inf")), token < V)
 
 
 @triton.jit
 def _sampling_metadata(Slots, Epochs, Live, Generation, Status, Params, TopK, Seed, Counter,
-                       PackedK, PackedP, PackedMinP, PackedSeed, PackedOffset, V: tl.constexpr, SLOTS: tl.constexpr = 4):
+                       PackedK, PackedP, PackedMinP, PackedSeed, PackedOffset, PackedGreedy, V: tl.constexpr, SLOTS: tl.constexpr = 4):
     row = tl.program_id(0)
     slot = tl.load(Slots + row)
     valid = (row < tl.load(Live)) & (slot >= 0) & (slot < SLOTS)
     valid &= tl.load(Generation + slot, valid, other=-1) == tl.load(Epochs + row)
     valid &= tl.load(Status + slot, valid, other=0) == 1
     k = tl.load(TopK + slot, valid, other=0)
-    tl.store(PackedK + row, tl.where(k > 0, tl.minimum(k, V), V))
-    tl.store(PackedP + row, tl.load(Params + slot * 6 + 1, valid, other=1.))
-    tl.store(PackedMinP + row, tl.load(Params + slot * 6 + 2, valid, other=0.))
+    greedy = valid & (tl.load(Params + slot * 6, valid, other=1.) == 0.)
+    tl.store(PackedGreedy + row, greedy)
+    tl.store(PackedK + row, tl.where(greedy, 1, tl.where(k > 0, tl.minimum(k, V), V)))
+    tl.store(PackedP + row, tl.where(greedy, 1., tl.load(Params + slot * 6 + 1, valid, other=1.)))
+    tl.store(PackedMinP + row, tl.where(greedy, 0., tl.load(Params + slot * 6 + 2, valid, other=0.)))
     tl.store(PackedSeed + row, tl.load(Seed + slot, valid, other=0))
     tl.store(PackedOffset + row, tl.load(Counter + slot, valid, other=0) * 4)
 
@@ -450,7 +452,7 @@ class PreparedSampling:
     Penalties and grammar precede temperature and FlashInfer top-k, softmax,
     and top-p. Both cutoff filters retain boundary ties. Min-p keeps equality
     against the largest remaining probability, then renormalizes. Temperature
-    must be positive.
+    is positive for stochastic rows; zero selects the lowest-ID argmax after penalties and grammar.
 
     Each row uses a separate FlashInfer call with device seed and
     offset=4*counter. CUDA's Philox subsequence is therefore zero regardless
@@ -467,7 +469,8 @@ class PreparedSampling:
             probability_mass=((rows, 1), torch.float32), packed_top_k=((rows,), torch.int32),
             packed_top_p=((rows,), torch.float32), packed_min_p=((rows,), torch.float32),
             packed_seed=((rows,), torch.uint64), packed_offset=((rows,), torch.uint64),
-            sampled_tokens=((rows,), torch.int32), sample_valid=((rows,), torch.bool))
+            sampled_tokens=((rows,), torch.int32), sample_valid=((rows,), torch.bool),
+            greedy_tokens=((rows, 1), torch.int64), packed_greedy=((rows,), torch.bool))
 
     def __init__(self, logits, state: DeviceRequestState, row_slot_ids, row_generations, live_rows,
                  completion: CompletionOutputs, frame_index, submission_sequence, *, sample_enabled: torch.Tensor | None = None,
@@ -490,6 +493,9 @@ class PreparedSampling:
         self.scratch_tensors = bind_scratch(self.scratch_layout(rows, vocab), device=device, workspace=workspace)
         for name, tensor in self.scratch_tensors.items():
             setattr(self, name, tensor)
+        from .greedy import PreparedGreedyDistribution
+
+        self.greedy = PreparedGreedyDistribution(self.greedy_tokens, vocab)
         self._rows = rows
         self._grid = (rows, triton.cdiv(vocab, 1024), 1)
         self._score_args = (logits, self.scores, row_slot_ids, row_generations, live_rows, state.generation,
@@ -499,7 +505,7 @@ class PreparedSampling:
         self._flashinfer = sampling
         self._metadata_args = (row_slot_ids, row_generations, live_rows, state.generation, state.status,
             state.parameters, state.top_k, state.seed, state.rng_counter, self.packed_top_k,
-            self.packed_top_p, self.packed_min_p, self.packed_seed, self.packed_offset, vocab, state.capacity)
+            self.packed_top_p, self.packed_min_p, self.packed_seed, self.packed_offset, self.packed_greedy, vocab, state.capacity)
         self._sanitize_args = (self.scores, self.maximum, vocab, 1024)
         self._normalize_args = (self.probabilities, self.probability_mass, vocab, 1024)
         # The top-p output address is graph-private and supplied during capture.
@@ -567,6 +573,7 @@ class PreparedSampling:
             num_warps=4, enable_fp_fusion=False)
         torch.sum(self.probabilities, dim=-1, keepdim=True, out=self.probability_mass)
         self._normalize()
+        self.greedy(self.scores, self.probabilities, self.packed_greedy)
         for row in range(self._rows):
             sampled, valid = sample_probabilities(self.probabilities[row:row + 1],
                 seed=self.packed_seed[row:row + 1], offset=self.packed_offset[row:row + 1],
@@ -608,8 +615,8 @@ def _admission_validate(Count, Slots, Epochs, Params, TopK, Budget, Eos, EosCoun
         scalar_valid &= tl.sum((~finite).to(tl.int32), 0) == 0
         temperature, top_p, min_p = tl.load(Params + row * 6), tl.load(Params + row * 6 + 1), tl.load(Params + row * 6 + 2)
         repetition = tl.load(Params + row * 6 + 3)
-        scalar_valid &= (temperature > 0.) & (top_p > 0.) & (top_p <= 1.) & (min_p >= 0.) & (min_p <= 1.) & (repetition > 0.)
-        scalar_valid &= (temperature >= 1.1754943508222875e-38)
+        scalar_valid &= (temperature >= 0.) & (top_p > 0.) & (top_p <= 1.) & (min_p >= 0.) & (min_p <= 1.) & (repetition > 0.)
+        scalar_valid &= (temperature == 0.) | (temperature >= 1.1754943508222875e-38)
         scalar_valid &= (top_p >= 1.1754943508222875e-38) & (repetition >= 1.1754943508222875e-38)
         k, budget = tl.load(TopK + row), tl.load(Budget + row)
         scalar_valid &= (k >= -1) & (k <= V) & (budget >= 0) & (budget <= 2147483647)

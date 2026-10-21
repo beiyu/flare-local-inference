@@ -473,7 +473,7 @@ the prepared graph contract maps them to backing storage and padding sentinels.
 The `images` feature adds `frontend::images::ImageProcessor` and PNG, JPEG,
 and static WebP decoding; it also enables `frontend`. Typed package metadata
 selects the preparation profile and token layout independently. Profiles cover
-Qwen, MiMo, DeepSeek, DeepSeek row-major, Moonvit, Step, and RADIO inputs.
+Qwen, MiMo, GLM, DeepSeek, DeepSeek row-major, Moonvit, Step, and RADIO inputs.
 The Qwen processor uses an RGB8, bicubic-antialias profile with
 16×16 patches, temporal duplication by two, spatial merge by two, a 48×48
 learned position table, and fused normalization `(pixel - 127.5) / 127.5`.
@@ -523,10 +523,12 @@ preprocessing execute in Rust.
 The GLM image frontend implements the deployment's upward-aligned padded
 canvases, CLIP normalization, 14×14 patches with two temporal copies, 2×2
 spatial ordering, atomic image-token spans, and graph-input packing. Its typed
-settings read the nested `processor_config.json` image configuration. This is
-frontend support only: the `glm53` recipe remains text-only until its BF16 vision
-encoder/projector, captured graphs and decoder feature injection are integrated
-and validated. Video remains unsupported. CPU processor parity is checked with
+settings read the nested `processor_config.json` image configuration. The
+local GLM EXL3 preparation variant selects BF16 encoder/projector graphs and
+generation-scoped prefill feature injection with a 2048-token image budget;
+the public NVFP4 recipe keeps its text-only default. GPU numerical parity,
+native replay, and full image-service qualification remain required before
+claiming deployment support. Video remains unsupported. CPU processor parity is checked with
 `tests/frontend/generate_glm_image_fixtures.py` against the deployment's actual
 processor; these fixtures do not qualify GPU vision or full image serving.
 

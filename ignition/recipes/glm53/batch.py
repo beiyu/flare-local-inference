@@ -47,7 +47,7 @@ class PreparedBatch:
     """
 
     def __init__(self, inputs: BatchInputs, requests: DeviceRequestState, metadata: DecoderMetadata,
-                 *, mode, shard: TensorParallelShard, pages, shards=None):
+                 *, mode, shard: TensorParallelShard, pages, shards=None, validate_prefill=None):
         rows, tokens = metadata.sample_indices.numel(), metadata.token_ids.numel()
         self.capacity = requests.capacity
         if mode not in ("prefill", "decode") or not 1 <= rows <= self.capacity:
@@ -64,6 +64,7 @@ class PreparedBatch:
 
         self.shards = ContextShards() if shards is None else shards
         self.accept_unsampled = shard.rank != 0
+        self.validate_prefill = validate_prefill
         device = metadata.token_ids.device
         self.row_ids = torch.arange(rows, device=device)
         self.slot_ids = torch.arange(self.capacity, device=device)
@@ -97,6 +98,8 @@ class PreparedBatch:
         if self.mode == "prefill":
             invalid_tokens = ((uploaded < 0) | (uploaded >= r.vocab_size)) & (self.token_offsets < lengths[0])
             valid &= (pending < 0) & ~invalid_tokens.any()
+            if self.validate_prefill is not None:
+                valid &= self.validate_prefill(uploaded, lengths)
         else:
             valid &= (uploaded >= 0) & (uploaded < r.vocab_size)
             valid &= (pending == uploaded) | (self.accept_unsampled & (pending < 0))

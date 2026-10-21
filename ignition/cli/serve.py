@@ -14,7 +14,7 @@ from ignition import planning
 from ignition.errors import CapacityError, FlareError, PreparationError, UsageError
 
 from . import display, environment
-from .preparation import (Host, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
+from .preparation import (Host, compiler_workers, preparation_directory, preparation_library, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
                           stream_overlap, tuning_devices)
 from .config import Configuration
 
@@ -54,7 +54,8 @@ def _server_options(configuration, model, plan) -> dict:
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
-        "max_body_bytes": plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN,
+        # Server::start rejects HTTP body budgets above 256 MiB.
+        "max_body_bytes": min(256 << 20, plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN),
         "context_hint": "context is limited by the checkpoint and available cache capacity",
         "capacity_hint": "--max-concurrency sets the request limit; a lower [memory] reserve leaves more KV pages",
         **({"decode_weight_bytes": checkpoint.decode_weight_bytes} if checkpoint.decode_weight_bytes > 0 else {}),
@@ -117,7 +118,7 @@ def run(args) -> int:
                   roce_ring=args.roce_ring,
                   mixed_prefill=args.mixed_prefill, expert_scale_compression=args.expert_scale_compression,
                   online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
-                  mla_compute_mode=args.mla_compute_mode)
+                  mla_compute_mode=args.mla_compute_mode, exl3_library=args.exl3_library, exl3_prefill_library=args.exl3_prefill_library, glm_vision_kernels=args.glm_vision_kernels)
     runtime = binary()
     host = configuration.get("server.host", args.host).value
     port = configuration.get("server.port", args.port).value
@@ -131,6 +132,12 @@ def run(args) -> int:
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
     command = [str(runtime), "run", str(package), "--gpus", ",".join(str(rank) for rank in range(plan.world_size)),
                "--host", host, "--port", str(port)]
+    command += ["--default-stop-scope", configuration.get("server.default_stop_scope", args.default_stop_scope).value]
+    default_limit = configuration.get("server.default_max_new_tokens", args.default_max_new_tokens).value
+    if default_limit is not None:
+        if not 1 <= default_limit <= 2**31 - 1:
+            raise UsageError("--default-max-new-tokens must be 1 through 2147483647")
+        command += ["--default-max-new-tokens", str(default_limit)]
     command += configuration.prefix_cache_flags()
     if args.served_model_name is not None:
         command += ["--served-model-name", args.served_model_name]
@@ -238,7 +245,10 @@ def _export_hosts(args, *, export_path) -> int:
                          mixed_prefill=args.mixed_prefill, expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache)
+    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   exl3_library=preparation_library(args.exl3_library),
+                   exl3_prefill_library=preparation_library(args.exl3_prefill_library, "--exl3-prefill-library"),
+                   glm_vision_kernels=preparation_directory(args.glm_vision_kernels))
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -308,7 +318,7 @@ def _prepare(args, *, export_path) -> int:
                       roce_ring=args.roce_ring,
                       mixed_prefill=args.mixed_prefill, expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
-                      mla_compute_mode=args.mla_compute_mode)
+                      mla_compute_mode=args.mla_compute_mode, exl3_library=args.exl3_library, exl3_prefill_library=args.exl3_prefill_library, glm_vision_kernels=args.glm_vision_kernels)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
         # A caller's restriction changes which GPU each index names.
         restricted = "" if host.restriction is None else f" of CUDA_VISIBLE_DEVICES={host.restriction}"
@@ -473,12 +483,21 @@ def serve(args) -> int:
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache)
+    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   exl3_library=preparation_library(args.exl3_library),
+                   exl3_prefill_library=preparation_library(args.exl3_prefill_library, "--exl3-prefill-library"),
+                   glm_vision_kernels=preparation_directory(args.glm_vision_kernels))
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
+    options["default_stop_scope"] = configuration.get("server.default_stop_scope", args.default_stop_scope).value
+    default_limit = configuration.get("server.default_max_new_tokens", args.default_max_new_tokens).value
+    if default_limit is not None:
+        if not 1 <= default_limit <= 2**31 - 1:
+            raise UsageError("--default-max-new-tokens must be 1 through 2147483647")
+        options["max_new_tokens"] = default_limit
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     preparation_options = {} if args.direct else {"retain_graphs": True}
     storage = None
@@ -575,6 +594,11 @@ def join(args) -> int:
 
     configuration = Configuration.load(args.config)
     hub_cache = configuration.directory("hub_cache")
+    local_checkpoint = args.local_checkpoint
+    if local_checkpoint is not None:
+        local_checkpoint = local_checkpoint.expanduser().resolve()
+        if not local_checkpoint.is_dir():
+            raise UsageError(f"local checkpoint directory does not exist: {local_checkpoint}")
     host = Host.discover()
     if not 0 <= args.gpu < len(host.gpus):
         raise UsageError(f"--gpu {args.gpu} names a GPU this host does not have")
@@ -585,6 +609,6 @@ def join(args) -> int:
                               topology=local_topology(gpu), report=progress)
     serve_peer(control, executor, args.rank, args.ranks, hub_cache=hub_cache, progress=progress,
                export_staging=configuration.directory("export_staging"), identity=identity,
-               package_cache=configuration.directory("package_cache"),
+               package_cache=configuration.directory("package_cache"), local_checkpoint=local_checkpoint,
                checkpoint_token_file=configuration.get("preparation.checkpoint_token_file").value)
     return 0

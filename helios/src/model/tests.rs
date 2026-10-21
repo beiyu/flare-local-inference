@@ -282,6 +282,76 @@ fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_
 }
 
 #[test]
+fn zero_temperature_admission_requires_explicit_prepared_sampling() {
+    let mut config = config();
+    let mut admission = Admission {
+        handle: crate::scheduler::RequestHandle {
+            slot: 0,
+            generation: 1,
+        },
+        sampling: SamplingParameters {
+            temperature: 0.,
+            ..Default::default()
+        },
+        max_new_tokens: 4,
+        prompt: vec![7],
+        data: PromptData {
+            positions: vec![[0; 3]],
+            vision_token_indices: vec![-1],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: false,
+    };
+    for (range, default, accepts_zero) in [
+        (None, 1., false),
+        (Some(SamplingRange { min: 0.95, max: 1. }), 1., false),
+        (Some(SamplingRange { min: 0., max: 1. }), 1., true),
+        (None, 0., true),
+    ] {
+        config.sampling_ranges.temperature = range;
+        config.sampling_defaults.temperature = default;
+        config
+            .sampling_ranges
+            .validate(&config.sampling_defaults)
+            .unwrap();
+        admission.sampling.temperature = 0.;
+        assert_eq!(admission.validate(&config).is_ok(), accepts_zero);
+        #[cfg(feature = "server")]
+        {
+            let mut prompt = crate::server::Prompt {
+                tokens: admission.prompt.clone(),
+                message_boundaries: vec![],
+                data: admission.data.clone(),
+                conditioned_inputs: vec![],
+                conditioning: vec![],
+                sampling: admission.sampling.clone(),
+                max_new_tokens: admission.max_new_tokens,
+                stop_sequences: vec![],
+                stop_strings: vec![],
+                string_stop_reasoning: None,
+                grammar: None,
+                ignore_eos: false,
+                logprobs: false,
+            };
+            assert_eq!(
+                super::admission::validate_prompt(&config, &prompt).is_ok(),
+                accepts_zero,
+            );
+            assert_eq!(
+                Admission::from_prompt(&config, admission.handle, &prompt, false).is_ok(),
+                accepts_zero,
+            );
+            // Positive direct sampling retains its existing range-independent API.
+            prompt.sampling.temperature = 0.5;
+            super::admission::validate_prompt(&config, &prompt).unwrap();
+        }
+        admission.sampling.temperature = 0.5;
+        admission.validate(&config).unwrap();
+    }
+}
+
+#[test]
 fn admission_rejects_nonfinite_parameters_and_inconsistent_positions() {
     assert!(
         SamplingParameters {

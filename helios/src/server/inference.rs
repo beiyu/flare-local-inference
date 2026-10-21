@@ -112,7 +112,8 @@ pub struct LogprobOptions {
     pub token_ids: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StringStopScope {
     #[default]
     All,

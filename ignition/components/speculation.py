@@ -191,7 +191,8 @@ class PreparedSpeculativeDistributions:
         return dict(scores=((batch, width, vocab), torch.float32),
             probabilities=((batch, width, vocab), torch.float32),
             maximum=((batch, width), torch.float32), valid=((batch, width), torch.bool),
-            packed_top_k=((batch * width,), torch.int32), packed_top_p=((batch * width,), torch.float32))
+            packed_top_k=((batch * width,), torch.int32), packed_top_p=((batch * width,), torch.float32),
+            greedy_tokens=((batch * width, 1), torch.int64))
 
     def __init__(self, logits, requests, slots, generations, live_rows, candidate_prefix_ids,
                  *, prefix_offset=0, grammar_masks=None, grammar_mask_count=None, workspace=None):
@@ -226,6 +227,8 @@ class PreparedSpeculativeDistributions:
             setattr(self, name, tensor)
         from ignition.components.probability_normalization import PreparedProbabilityNormalization
         self.normalization = PreparedProbabilityNormalization(self.probabilities, self.valid)
+        from ignition.components.greedy import PreparedGreedyDistribution
+        self.greedy = PreparedGreedyDistribution(self.greedy_tokens, vocab, vocab_ids=self.vocab_ids)
         self._prepared = False
 
     def prepare_scores(self):
@@ -264,8 +267,10 @@ class PreparedSpeculativeDistributions:
                                     | ((prefix[None, :] < count) & (count <= 8)))
         elif columns.numel() > 1:
             self.valid.logical_and_(~state.grammar_enabled[safe, None].bool() | (prefix[None, :] == 0))
-        self.packed_top_k.copy_(torch.where(state.top_k[safe] > 0, state.top_k[safe], state.vocab_size)[:, None].expand_as(self.valid).reshape(-1))
-        self.packed_top_p.copy_(params[:, 1:2].expand_as(self.valid).reshape(-1))
+        greedy = params[:, 0] == 0
+        self.packed_top_k.copy_(torch.where(greedy, 1, torch.where(state.top_k[safe] > 0,
+            state.top_k[safe], state.vocab_size))[:, None].expand_as(self.valid).reshape(-1))
+        self.packed_top_p.copy_(torch.where(greedy[:, None], 1., params[:, 1:2]).expand_as(self.valid).reshape(-1))
         return safe, params
 
     def prepare(self):
@@ -291,7 +296,10 @@ class PreparedSpeculativeDistributions:
         flat = self.scores.view(-1, self.state.vocab_size)
         filter_probabilities_out(flat, self.packed_top_k, self.packed_top_p,
             *self.library_scratch, self.probabilities.view_as(flat), self.top_p_workspace)
-        return self.normalization(self.probabilities, params)
+        self.normalization(self.probabilities, params)
+        self.greedy(flat, self.probabilities.view_as(flat),
+            (params[:, :1] == 0).expand_as(self.valid).reshape(-1))
+        return self.probabilities
 
 
 class PreparedStochasticVerification:

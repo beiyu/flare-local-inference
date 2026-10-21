@@ -186,6 +186,10 @@ class Plan:
     online_mxfp8: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
+    # Preparation-only CUDA library; exported serving uses captured modules.
+    exl3_library: Path | None = None
+    exl3_prefill_library: Path | None = None
+    glm_vision_kernels: Path | None = None
 
     @property
     def world_size(self) -> int:
@@ -290,6 +294,9 @@ class Plan:
             "expert_scale_compression": self.expert_scale_compression,
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
+            "exl3_library": None if self.exl3_library is None else str(self.exl3_library),
+            "exl3_prefill_library": None if self.exl3_prefill_library is None else str(self.exl3_prefill_library),
+            "glm_vision_kernels": None if self.glm_vision_kernels is None else str(self.glm_vision_kernels),
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,

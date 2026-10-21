@@ -167,6 +167,8 @@ accepts `--output FILE` and defaults to a local snapshot; it excludes `--host` a
 | `--max-concurrency N` | Maximum simultaneously active requests, 1 through the recipe's limit | `defaults.max_concurrency`, else the recipe default |
 | `--host ADDR` | Listening address. `run` only. | `server.host`, else `127.0.0.1` |
 | `--port N` | Listening port. `run` only. | `server.port`, else `8000` |
+| `--default-stop-scope all\|after_reasoning` | String-stop scope for omitted/null request fields; explicit requests override it. Native `flare run` also accepts it. Does not change the package cache key. | `server.default_stop_scope`, else `all` |
+| `--default-max-new-tokens N` | Output limit for requests that omit it; explicit request limits override it. Native `flare run` also accepts it. Does not change package preparation. | `server.default_max_new_tokens`, else package |
 | `--served-model-name ALIAS` | `run` only: replace the serving alias when Flare loads the package | Package alias |
 | `--verbose` | Per-phase detail on stderr | off |
 | `--kv-cache-limit concurrency\|context\|memory` | `run` only: pass the shared KV-pool ceiling to Flare without changing preparation | `memory` |
@@ -200,6 +202,9 @@ explicit flags take precedence.
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
+| `--exl3-library PATH` | Explicit validated EXL3 shared library used only during preparation. Its bytes enter the package cache identity; native serving loads captured cubins without this library. | None; EXL3 rejects omission |
+| `--exl3-prefill-library PATH` | Original EXL3 extension binary used to extract the required prefill cubins at preparation time. Its bytes enter the package cache identity; native serving uses the captured kernels. | None; EXL3 prefill rejects omission |
+| `--glm-vision-kernels DIR` | Existing original GLM norm/rotary kernel directory. BF16 EXL3 text preparation also needs its exact RMSNorm arithmetic; image preparation uses the same assets. Every `manifest.json` and `.cubin` file enters the package cache identity by relative path and SHA-256 content. The recipe validates required assets before capture; native serving uses exported kernels. | None; required for BF16 EXL3 text or GLM vision, unused by the existing text-only NVFP4 path |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
 | `--online-mxfp8` | Store the recipe's eligible BF16 projections as MXFP8 while loading (Kimi K3: KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark draft context, outputs and MLPs), trading checkpoint precision for decode bandwidth. MLA's batched key/value projections retain BF16. Recipes that name no such projections reject it. Selects a separate cached package. | Checkpoint precision |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. Selects a separate cached package. | The recipe's image support |
@@ -281,6 +286,14 @@ CPU and GPU allocations share one memory budget. Multi-host preparation keeps
 its rank coordination, candidate sharing, and compiled-forward distribution;
 `--compile-workers` sets a separate budget on each host. Local tuning replicas
 are selected only by `--tuning-gpus`.
+
+`ignition join ADDR:PORT --rank R --ranks N --local-checkpoint DIR` uses an
+existing peer-local checkpoint after authenticated whole-file SHA256 comparison
+against rank zero. This option belongs to the joining host, not the model plan.
+The directory must have identical relative files and snapshot basename, including
+customized weights and templates; a mismatch fails rather than falling back.
+Without it, peers request authenticated remote ranges. See
+[multi-host preparation](multi-host.md#prepare-the-package).
 
 Both Ignition commands accept `--config`.
 
@@ -392,9 +405,10 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--gpus N[,N...]` | Selected GPUs in rank order; indices follow an inherited `CUDA_VISIBLE_DEVICES` list when present | `0` |
 | `--host ADDR` | Listener IP address, IPv4 or IPv6 | `127.0.0.1` |
 | `--port N` | Listener port | `8000` |
-| `--served-model-name ALIAS` | Replace the package's serving aliases with this nonblank alias | Package aliases |
+| `--served-model-name ALIAS` | Replace package aliases with these nonblank aliases; repeat to provide several | Package aliases |
 | `--api-key-file PATH` | File containing the serving API key | No authentication |
 | `--max-concurrency N` | Reduce concurrency within captured batch capacities | Package default |
+| `--max-images-per-prompt N` | Native `run` and `orbit run`: tighten the shared image processor count limit and discovery advertisement. Positive values cannot expand the prepared context-derived limit. | Context-derived count |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`), or fraction of total memory (`0.8`) | Package serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
@@ -438,8 +452,12 @@ alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as
 they do not set the advertised API name. Existing packages retain their
 embedded aliases.
 
-`--served-model-name` changes the name advertised by `/v1/models` and accepted
-for requests. It replaces the package aliases; the canonical model ID remains
+`--served-model-name` changes the name advertised by `/v1/models`, returned in
+generation response `model` fields, and accepted for requests. Native `flare run`
+and `flare orbit run` accept repeated flags in order: the first alias is advertised
+and returned in responses, and all aliases are accepted for requests. Discovery and
+responses use the first nonempty served alias, or the canonical ID when no alias
+is configured. It replaces the package aliases; the canonical model ID remains
 accepted and appears as the model card's `root`. The override does not modify
 the package, change its identity, or select a different cached package in
 `ignition run`. Both launchers accept numeric IPv4 and IPv6 addresses through
@@ -750,6 +768,8 @@ the resolved values present as comments.
 host = "127.0.0.1"
 port = 8000
 api_key = ""                      # Empty: no authentication.
+default_stop_scope = "all"         # all or after_reasoning; request can override.
+# default_max_new_tokens = 65536   # Omitted: package default; request can override.
 
 [defaults]
 model = "qwen3.8-flash"

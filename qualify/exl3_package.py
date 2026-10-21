@@ -6,6 +6,10 @@ route weights. No weights are requantized. The probe captures its fixed-buffer
 launch, exports with the production allocator and exporter, and optionally runs
 the existing Rust fixed-package checker in a fresh process. It does not qualify
 complete-forward compilation, prefill, tensor-parallel collectives, or HTTP.
+With --prefill-library and rows 33/65/4096, it instead loads two distinct experts,
+compiles the original thin/E3 composition, and tests the same fresh-process native
+package boundary. Numerical agreement with production is checked separately by
+qualify.glm_exl3_reference.
 
 Build the checker before running on an explicitly assigned, idle SM121 GPU:
 
@@ -192,8 +196,13 @@ def export_probe(args):
         args.output.mkdir(parents=True, exist_ok=False)
         with PackageStorage(device=0) as storage:
             device = torch.device("cuda", 0)
-            weights = load_expert(manifest, contract, args.tp_rank, device)
-            call = CooperativeCall(args.library, weights, args.rows, device)
+            if args.prefill_library is None:
+                weights = load_expert(manifest, contract, args.tp_rank, device)
+                call = CooperativeCall(args.library, weights, args.rows, device)
+            else:
+                from qualify.glm_exl3_reference import _PackageCall
+
+                call = _PackageCall(args, manifest, device)
             call.output.fill_(math.nan)
             call()
             torch.cuda.synchronize()
@@ -248,6 +257,8 @@ def export_probe(args):
             finally:
                 torch.cuda.synchronize()
                 graph.reset()
+                if args.prefill_library is not None:
+                    call.close()
     print("EXL3 subset exported; native package reload/replay is still required", flush=True)
 
 
@@ -258,10 +269,11 @@ def parser():
     result.add_argument("--library", type=Path, required=True)
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--native-executable", type=Path)
+    result.add_argument("--prefill-library", type=Path, help="original production EXL3 extension; captures its exact thin/E3 images")
     result.add_argument("--layer", type=int, default=3)
     result.add_argument("--expert", type=int, default=0)
     result.add_argument("--tp-rank", type=int, choices=(0, 1), default=0)
-    result.add_argument("--rows", type=int, choices=range(1, MAX_ROWS + 1), default=1)
+    result.add_argument("--rows", type=int, choices=(*range(1, MAX_ROWS + 1), 33, 65, 4096), default=1)
     return result
 
 
@@ -270,6 +282,10 @@ def main(argv=None):
     args = cli.parse_args(argv)
     try:
         tensor_contract(args.layer, args.expert)
+        if args.prefill_library is None and args.rows > MAX_ROWS:
+            raise ValueError("invalid choice for cooperative rows: above 32 requires --prefill-library")
+        if args.prefill_library is not None and args.rows <= MAX_ROWS:
+            raise ValueError("original thin/E3 package probe requires more than 32 rows")
         if args.output.exists():
             raise FileExistsError(f"output already exists: {args.output}")
         if args.action == "export":
@@ -280,6 +296,8 @@ def main(argv=None):
         arguments = [sys.executable, "-m", "qualify.exl3_package", "export"]
         for name in ("checkpoint", "library", "output", "layer", "expert", "tp_rank", "rows"):
             arguments.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
+        if args.prefill_library is not None:
+            arguments.extend(("--prefill-library", str(args.prefill_library)))
         # The exporting child must exit before the independent Rust context reserves
         # the recorded addresses. The orchestrator itself never imports Torch.
         subprocess.run(arguments, check=True)

@@ -3,7 +3,7 @@
 mod decode;
 mod encode;
 use super::{inference, observation::ObservationOptions};
-pub(super) use decode::decode;
+pub(super) use decode::{decode, decode_with_stop_scope};
 pub(super) use encode::{Encoder, Frame, PromptUsage};
 use serde_json::Value;
 

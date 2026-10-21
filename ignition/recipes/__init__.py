@@ -181,6 +181,16 @@ def _hub_metadata(repository: str, revision: str | None, hub_cache: Path | None)
         raise FetchError(f"cannot read {repository} from Hugging Face: {error}") from error
 
 
+def _checkpoint_variant(snapshot: Path, recipe: Recipe, checkpoint: Checkpoint):
+    if checkpoint.architecture != "Glm5NextForConditionalGeneration":
+        return recipe, checkpoint
+    from .glm53.recipe import checkpoint_variant
+    try:
+        return checkpoint_variant(snapshot, recipe, checkpoint)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise UsageError(f"{snapshot}: cannot prepare GLM checkpoint variant: {error}") from error
+
+
 def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
     """Resolve an alias, a Hugging Face repository id with an optional `@revision`, or a checkpoint directory.
 
@@ -199,6 +209,7 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
             for checkpoint in recipe.checkpoints:
                 # A directory that a recipe declares keeps its declared placement.
                 if Path(checkpoint.repository).is_absolute() and Path(checkpoint.repository).resolve() == directory:
+                    recipe, checkpoint = _checkpoint_variant(metadata, recipe, checkpoint)
                     return ResolvedModel(recipe, checkpoint, directory)
         recipe, qualified = _supporting(metadata / "config.json", str(directory))
         # The directory's path identifies its measurements on this host.
@@ -206,7 +217,9 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
         index = directory / "model.safetensors.index.json"
         stored = (_csf_stored_bytes(container, directory) if container is not None else
                   _stored_bytes(index, str(directory)) if index.exists() else qualified.stored_bytes)
-        return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)
+        replacement = _replacement(qualified, str(directory), revision, stored)
+        recipe, replacement = _checkpoint_variant(metadata, recipe, replacement)
+        return ResolvedModel(recipe, replacement, directory)
     repository, _, revision = model.partition("@")
     if "/" not in repository:
         for recipe in recipes():
@@ -230,4 +243,5 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
     recipe, qualified = _supporting(config_path, model)
     # The hub cache stores each file under its commit hash.
     replacement = _replacement(qualified, repository, config_path.parent.name, _stored_bytes(index_path, model))
+    recipe, replacement = _checkpoint_variant(config_path.parent, recipe, replacement)
     return ResolvedModel(recipe, replacement)

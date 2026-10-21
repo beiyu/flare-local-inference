@@ -1,10 +1,11 @@
-"""GLM sigmoid routing, NVFP4 experts, and the MXFP8 shared expert."""
+"""GLM sigmoid routing with checkpoint-native routed and shared expert precision."""
 
 from dataclasses import dataclass
 
 import torch
 
 from ignition.components.expert_overlap import ConcurrentSharedExpert
+from ignition.components.exl3 import Exl3Experts, PreparedExl3Experts
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import PreparedRoutedExperts, PreparedRouter, RouterScratch
@@ -38,7 +39,7 @@ class MoeScratch:
 class PreparedGlmMoe:
     """One rank's intermediate-sharded expert contribution before all-reduce."""
 
-    def __init__(self, module, source, weights, scratch: MoeScratch, *, session, name, workspace, prefill=False):
+    def __init__(self, module, source, weights, scratch: MoeScratch, *, session, name, workspace, prefill=False, num_valid_tokens=None):
         gate = module.gate
         if (gate.num_group != 1 or gate.topk_group != 1 or gate.top_k != 8 or gate.num_experts != 288
                 or not gate.norm_topk_prob or gate.routed_scaling_factor != 2.5):
@@ -55,16 +56,20 @@ class PreparedGlmMoe:
             session=session, name=f"{name}.router")
         self.routing = PreparedRouter(scratch.router_logits, scratch.router, session=session,
             name=f"{name}.route_topk", score_func="sigmoid", renormalize=True,
-            routed_scaling_factor=2.5, correction_bias=weights.correction)
+            routed_scaling_factor=2.5, correction_bias=weights.correction, num_valid_tokens=num_valid_tokens)
         self.shared = PreparedMLP(source, weights.shared, scratch.shared.gate_up, scratch.shared.intermediate,
             scratch.shared.output, session=session, name=f"{name}.shared", workspace=workspace,
             swiglu_limit=module.config.swiglu_limit)
-        self.experts = PreparedRoutedExperts(source, weights.experts, scratch.router.ids,
-            scratch.router.weights, scratch.routed, session=session, name=f"{name}.experts", workspace=workspace,
-            router_plan=self.routing.plan,
-            a4_prefill=prefill and weights.experts_a4_prefill)
+        exl3 = isinstance(weights.experts, Exl3Experts)
+        if exl3:
+            self.experts = PreparedExl3Experts(source, weights.experts, scratch.router.ids,
+                scratch.router.weights, scratch.routed, limit=module.config.swiglu_limit, num_valid_tokens=num_valid_tokens)
+        else:
+            self.experts = PreparedRoutedExperts(source, weights.experts, scratch.router.ids,
+                scratch.router.weights, scratch.routed, session=session, name=f"{name}.experts", workspace=workspace,
+                router_plan=self.routing.plan, a4_prefill=prefill and weights.experts_a4_prefill)
         self.concurrent_shared = None
-        if source.shape[0] <= 256 and workspace.overlap:
+        if not exl3 and source.shape[0] <= 256 and workspace.overlap:
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.routing.plan, self.experts.plan),
                 session=session, workspace=workspace, defer_launch=source.shape[0] == 1)

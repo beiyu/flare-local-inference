@@ -62,7 +62,7 @@ pub struct Admission {
 
 impl Admission {
     pub fn validate(&self, config: &ModelConfig) -> Result<()> {
-        self.sampling.validate()?;
+        validate_sampling(config, &self.sampling)?;
         if self.handle.slot as usize >= config.limits.max_active
             || self.handle.generation == 0
             || self.handle.generation > i64::MAX as u64
@@ -118,9 +118,28 @@ impl Admission {
     }
 }
 
+// A zero minimum/default was invalid in older prepared packages. Direct callers
+// bypass HTTP range clamping, so only send zero to explicitly prepared kernels.
+fn validate_sampling(config: &ModelConfig, sampling: &SamplingParameters) -> Result<()> {
+    sampling.validate()?;
+    if sampling.temperature == 0.
+        && config.sampling_defaults.temperature != 0.
+        && config
+            .sampling_ranges
+            .temperature
+            .is_none_or(|range| range.min != 0.)
+    {
+        return Err(crate::Error::admission(
+            crate::AdmissionError::Feature,
+            "zero temperature requires prepared sampling with a zero minimum or default",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "server")]
 pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> Result<()> {
-    prompt.sampling.validate()?;
+    validate_sampling(config, &prompt.sampling)?;
     if prompt
         .tokens
         .len()

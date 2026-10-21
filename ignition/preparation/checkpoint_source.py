@@ -14,6 +14,7 @@ import stat
 import struct
 import tempfile
 import threading
+import time
 
 
 BLOCK_BYTES = 4 << 20
@@ -225,6 +226,21 @@ class RootSource:
             self.close()
             raise
 
+    def digest(self, name):
+        """Hash an admitted file with bounded memory and immutable descriptor identity."""
+        held = self.files[relative_name(name)]
+        held.validate()
+        digest = hashlib.sha256()
+        for offset in range(0, held.identity[2], BLOCK_BYTES):
+            size = min(BLOCK_BYTES, held.identity[2] - offset)
+            data = os.pread(held.descriptor, size, offset)
+            if len(data) != size:
+                raise ConnectionError("checkpoint digest read was truncated")
+            digest.update(data)
+            release_read_pages(held.descriptor, offset, size)
+        held.validate()
+        return digest.hexdigest()
+
     def read(self, name, offset, width, rows=1, stride=0):
         held = self.files[relative_name(name)]
         extent = row_extent(held.identity[2], offset, width, rows, stride)
@@ -274,6 +290,9 @@ class SourceServer:
                         held.validate()
                     channel.send("finished", stats=self.stats)
                     return
+                elif kind == "sha256":
+                    name = relative_name(message["name"])
+                    channel.send("sha256", name=name, sha256=self.source.digest(name))
                 elif kind == "read":
                     fields = message["read"]
                     data = self.source.read(**fields)
@@ -305,9 +324,11 @@ class SourceServer:
 
 
 class RemoteSource:
-    """A scoped source directory containing real metadata and no tensor files."""
+    """Authenticate remote metadata, then use requested ranges or an exact local mirror."""
 
-    def __init__(self, connection, key, rank, identity, checkpoint, *, directory=None, on_created=None):
+    def __init__(self, connection, key, rank, identity, checkpoint, *, directory=None, on_created=None,
+                 local_snapshot=None, progress=None):
+        self.local = None
         self.channel, digest = authenticate(connection, key, rank=rank, identity=identity)
         _, payload = self.channel.receive("catalog")
         if hashlib.sha256(payload).hexdigest() != digest:
@@ -340,6 +361,7 @@ class RemoteSource:
         self.snapshot.mkdir()
         self.headers = {}
         self.stats = dict(payload_bytes=0, metadata_bytes=0, requests=0)
+        self.local_stats = dict(payload_bytes=0, metadata_bytes=0, requests=0)
         self.finished = False
         (self.snapshot / MARKER).write_text(json.dumps(dict(catalog_sha256=digest)))
         try:
@@ -356,6 +378,27 @@ class RemoteSource:
                     target = self.snapshot / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(content)
+            if local_snapshot is not None:
+                self.local = RootSource(local_snapshot, checkpoint)
+                if self.local.catalog != catalog:
+                    raise ValueError("local checkpoint catalog differs from the authenticated source")
+                total_bytes = sum(entry["bytes"] for entry in self.files.values())
+                validated_bytes, reported = 0, time.monotonic()
+                if progress is not None:
+                    progress(f"verify local checkpoint: 0/{len(self.files)} files, 0.00/{total_bytes / (1 << 30):.2f} GiB")
+                for index, name in enumerate(self.files, 1):
+                    # The coordinator hashes concurrently with the peer; the response is HMAC bound.
+                    self.channel.send("sha256", name=name)
+                    local_digest = self.local.digest(name)
+                    message, payload = self.channel.receive("sha256")
+                    if payload or message.get("name") != name or message.get("sha256") != local_digest:
+                        raise ValueError(f"local checkpoint whole-file SHA256 differs: {name}")
+                    validated_bytes += self.files[name]["bytes"]
+                    now = time.monotonic()
+                    if progress is not None and (now - reported >= 5 or index == len(self.files)):
+                        progress(f"verified local checkpoint: {index}/{len(self.files)} files, "
+                                 f"{validated_bytes / (1 << 30):.2f}/{total_bytes / (1 << 30):.2f} GiB")
+                        reported = now
             self.channel.send("ready")
             self.channel.receive("ready")
         except BaseException:
@@ -364,6 +407,9 @@ class RemoteSource:
 
     @contextmanager
     def activate(self):
+        if self.local is not None:
+            for held in self.local.files.values():
+                held.validate()
         value = _OWNER.set(self)
         try:
             yield self.snapshot
@@ -378,16 +424,24 @@ class RemoteSource:
             raise RuntimeError("checkpoint reader has already drained")
         entry = self.files[relative_name(name)]
         row_extent(entry["bytes"], offset, width, rows, stride)
-        self.channel.send("read", read=dict(name=name, offset=offset, width=width, rows=rows, stride=stride))
-        _, data = self.channel.receive("data")
+        if self.local is not None:
+            data = self.local.read(name, offset, width, rows, stride)
+            stats = self.local_stats
+        else:
+            self.channel.send("read", read=dict(name=name, offset=offset, width=width, rows=rows, stride=stride))
+            _, data = self.channel.receive("data")
+            stats = self.stats
         if len(data) != width * rows:
             raise ConnectionError("checkpoint source returned a different byte extent")
-        self.stats["payload_bytes" if entry["header_bytes"] is not None and offset >= entry["header_bytes"]
-                   else "metadata_bytes"] += len(data)
-        self.stats["requests"] += 1
+        stats["payload_bytes" if entry["header_bytes"] is not None and offset >= entry["header_bytes"]
+              else "metadata_bytes"] += len(data)
+        stats["requests"] += 1
         return data
 
     def finish(self):
+        if self.local is not None:
+            for held in self.local.files.values():
+                held.validate()
         self.channel.send("finished", stats=self.stats)
         message, _ = self.channel.receive("finished")
         if message["stats"] != self.stats:
@@ -395,6 +449,9 @@ class RemoteSource:
         self.finished = True
 
     def close(self):
+        if self.local is not None:
+            self.local.close()
+            self.local = None
         self.temporary.cleanup()
 
 

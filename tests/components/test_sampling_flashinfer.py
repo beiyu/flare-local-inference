@@ -285,3 +285,37 @@ def test_native_flashinfer_mixed_temperatures_eos_and_budget_stop_are_terminal(v
         after = snapshot(owner.state)
         for name in before:
             assert torch.equal(before[name], after[name]), name
+
+
+@pytest.mark.parametrize("compile_forward", [False, True, "aot"])
+def test_native_zero_temperature_is_exact_argmax_with_ties_grammar_and_mixed_rows(compile_forward):
+    with captured(4, vocab_size=10000, compile_forward=compile_forward) as owner:
+        owner.slots.copy_(torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int32))
+        owner.live.fill_(4)
+        owner.epochs[3] = 99
+        for seed in (17, 2**64 - 79):
+            owner.admit(2, seed=seed, temperature=0., top_k=1, top_p=.01, min_p=1.)
+            owner.admit(0, seed=seed + 1, temperature=-0., top_k=0, top_p=.9, min_p=.5)
+            owner.admit(3, seed=seed + 2, temperature=1., top_k=1, top_p=1.)
+            owner.admit(1, seed=seed + 3, temperature=0.)
+            owner.state.grammar_enabled[0] = 1
+            owner.state.grammar_mask[0].zero_()
+            owner.state.grammar_mask[0, 0] = (1 << 3) | (1 << 4)
+            owner.logits.fill_(-torch.inf)
+            owner.logits[0, 5:7] = 9.
+            owner.logits[1, 2] = 10.
+            owner.logits[1, 3:5] = 9.
+            owner.logits[2, :4] = 1.
+            owner.logits[3, 0] = 1.
+            records = owner.replay()
+            assert records[2, 4].item() == 5
+            assert records[0, 4].item() == 3
+            assert records[1, 4].item() == -1
+            assert owner.state.rng_counter[1].item() == 0
+            assert owner.sampler.probabilities[0, 5].item() == 1.
+            assert owner.sampler.probabilities[1, 3].item() == 1.
+            assert owner.sampler.probabilities[0].count_nonzero().item() == 1
+            assert owner.sampler.probabilities[1].count_nonzero().item() == 1
+            # A stochastic top-k=1 row still retains all boundary ties.
+            torch.testing.assert_close(owner.sampler.probabilities[2, :4],
+                torch.full((4,), .25, device="cuda"), rtol=0, atol=0)

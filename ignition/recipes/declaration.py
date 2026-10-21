@@ -38,8 +38,9 @@ class SamplingDefaults:
                   self.presence_penalty, self.frequency_penalty)
         if (any(type(v) not in (int, float) or not math.isfinite(v)
                 or abs(v) > float.fromhex("0x1.fffffep+127") for v in values)
-                or any(v < float.fromhex("0x1p-126") for v in
-                       (self.temperature, self.top_p, self.repetition_penalty))
+                or self.temperature < 0
+                or (self.temperature > 0 and self.temperature < float.fromhex("0x1p-126"))
+                or any(v < float.fromhex("0x1p-126") for v in (self.top_p, self.repetition_penalty))
                 or not 0 < self.top_p <= 1 or not 0 <= self.min_p <= 1
                 or type(self.top_k) is not int or not -1 <= self.top_k < 2**31
                 or type(self.seed) is not int or not 0 <= self.seed < 2**64):

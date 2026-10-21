@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 
 import torch
-from flashinfer.triton.norm import rms_norm
 
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.mhc import MHCScratch
@@ -15,6 +14,7 @@ from .decoder import LayerScratch, PreparedGlmLayer
 from .kda import KDAScratch
 from .mla import MLAScratch
 from .moe import MoeScratch
+from .projections import rms_norm
 from .state import DecoderMetadata, DecoderState
 from .weights import ModelWeights, MoEWeights
 
@@ -99,7 +99,7 @@ class PreparedDecoder:
 
     def __init__(self, weights: ModelWeights, scratch: DecoderScratch, state: DecoderState,
                  metadata: DecoderMetadata, *, mode, runtime, vocabulary_runtime, coordinator, session, name,
-                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None):
+                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, vision=None, norm_kernels=None):
         language = weights.tree.model.language_model
         if len(weights.layers) != 45 or len(language.layers) != 45 or len(state.layers) != 45:
             raise ValueError("GLM text execution requires all 45 decoder layers")
@@ -108,7 +108,8 @@ class PreparedDecoder:
         if metadata.sample_indices.shape != scratch.hidden.shape[:1]:
             raise ValueError("GLM sample indices and hidden-output capacities differ")
         self.weights, self.scratch, self.state, self.metadata = weights, scratch, state, metadata
-        self.feedback = feedback
+        self.feedback, self.norm_kernels = feedback, norm_kernels
+        self.vision = vision if mode == "prefill" else None
         self.embedding = PreparedEmbedding(language.embed_tokens.weight, metadata.token_ids, scratch.embedding,
             num_rows=metadata.recurrent.num_tokens, session=session, name=f"{name}.embedding")
         self.layers = []
@@ -122,7 +123,8 @@ class PreparedDecoder:
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
                 carry=None if index == 0 else scratch.mlp_hc, defer_post=index < len(language.layers) - 1,
                 max_cache_pages=max_cache_pages, context=context,
-                kda_records=None if kda_records is None or indexed else kda_records.layer(index))
+                kda_records=None if kda_records is None or indexed else kda_records.layer(index),
+                num_valid_tokens=metadata.recurrent.num_tokens, norm_kernels=norm_kernels)
             self.layers.append(layer)
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")
@@ -143,7 +145,10 @@ class PreparedDecoder:
 
     def __call__(self):
         s, language = self.scratch, self.weights.tree.model.language_model
-        s.residual.copy_(self.embedding()[:, None, :])
+        embedding = self.embedding()
+        if self.vision is not None:
+            self.vision.inject(self.metadata, embedding)
+        s.residual.copy_(embedding[:, None, :])
         value = s.residual
         for layer in self.layers:
             value = layer(value)
@@ -151,11 +156,11 @@ class PreparedDecoder:
             torch.index_select(s.residual, 0, self.metadata.sample_indices, out=s.selected_residual)
             collapsed = language.hc_head(s.selected_residual[:, None]).squeeze(1)
             rms_norm(collapsed, language.norm.weight, s.hidden, language.norm.variance_epsilon,
-                round_before_weight=True)
+                projection_weight=self.weights.layers[0].attention["input_proj"], kernels=self.norm_kernels)
         else:
             collapsed = language.hc_head(s.residual[:, None]).squeeze(1)
             rms_norm(collapsed, language.norm.weight, self.feedback, language.norm.variance_epsilon,
-                round_before_weight=True)
+                projection_weight=self.weights.layers[0].attention["input_proj"], kernels=self.norm_kernels)
             torch.index_select(self.feedback, 0, self.metadata.sample_indices, out=s.hidden)
         self.lm_head(s.hidden)
         return s.hidden

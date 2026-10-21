@@ -168,8 +168,8 @@ class SamplingParameters:
                   self.presence_penalty, self.frequency_penalty)
         if any(not math.isfinite(value) for value in values):
             raise AdmissionError("sampling parameters must be finite")
-        if self.temperature <= 0:
-            raise AdmissionError("temperature must be positive; greedy decoding is not supported")
+        if self.temperature < 0 or (self.temperature > 0 and self.temperature < float.fromhex("0x1p-126")):
+            raise AdmissionError("temperature must be zero or a positive normal FP32 value")
         if not 0 < self.top_p <= 1 or not 0 <= self.min_p <= 1 or self.repetition_penalty <= 0:
             raise AdmissionError("require 0 < top_p <= 1, 0 <= min_p <= 1 and repetition_penalty > 0")
         if type(self.seed) is not int or not 0 <= self.seed < 1 << 64 or type(self.top_k) is not int:

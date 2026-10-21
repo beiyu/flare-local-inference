@@ -62,7 +62,7 @@ class PreparedGlmLayer:
     def __init__(self, module, attention_weights, mlp_weights, residual_weights,
                  source, output, scratch: LayerScratch, state, metadata, *,
                  mode, runtime, coordinator, session, name, workspace, carry=None, defer_post=False,
-                 max_cache_pages=None, context=None, kda_records=None):
+                 max_cache_pages=None, context=None, kda_records=None, num_valid_tokens=None, norm_kernels=None):
         if module.block_type not in ("linear_attention", "indexed_attention"):
             raise ValueError("prepared GLM layer requires canonical KDA or sparse MLA attention")
         rows = scratch.attention.output.shape[0]
@@ -90,7 +90,7 @@ class PreparedGlmLayer:
         else:
             self.attention = PreparedGlmMLA(*attention_args, mode=mode, session=session, name=f"{name}.mla",
                                             workspace=workspace, max_cache_pages=max_cache_pages,
-                                            context=context)
+                                            context=context, norm_kernels=norm_kernels)
         self.attention_reduce = PreparedAllReduce(scratch.attention.output, scratch.attention_output, runtime=runtime,
             session=session, coordinator=coordinator, name=f"{name}.attention_reduce")
         self.mlp_hc = PreparedMHC((scratch.attention_output, scratch.attention_hc.residual,
@@ -99,7 +99,7 @@ class PreparedGlmLayer:
         if isinstance(mlp_weights, MoEWeights):
             self.mlp = PreparedGlmMoe(module.mlp, scratch.mlp_hc.normalized, mlp_weights, scratch.mlp,
                                       session=session, name=f"{name}.moe", workspace=workspace,
-                                      prefill=mode == "prefill")
+                                      prefill=mode == "prefill", num_valid_tokens=num_valid_tokens)
         else:
             self.mlp = PreparedMLP(scratch.mlp_hc.normalized, mlp_weights, scratch.mlp.gate_up,
                 scratch.mlp.intermediate, scratch.mlp.output, session=session, name=f"{name}.mlp", workspace=workspace,

@@ -20,17 +20,18 @@ struct ModelCatalog {
     names: HashSet<String>,
 }
 
+pub(super) fn serving_name<'a>(model: &'a ModelConfig, served_names: &'a [String]) -> &'a str {
+    served_names.iter().find(|name| !name.is_empty()).map(String::as_str).unwrap_or(&model.model_id)
+}
+
 impl ModelCatalog {
-    fn new(model: &ModelConfig, served_names: &[String]) -> Self {
+    fn new(model: &ModelConfig, served_names: &[String], image_limits: Option<crate::frontend::images::ImageLimits>) -> Self {
         // The timestamp describes this serving instance, not the source checkpoint.
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let id = served_names
-            .iter()
-            .find(|name| !name.is_empty())
-            .unwrap_or(&model.model_id);
+        let id = serving_name(model, served_names);
         let names = std::iter::once(&model.model_id)
             .chain(served_names)
             .filter(|name| !name.is_empty())
@@ -38,12 +39,12 @@ impl ModelCatalog {
             .collect();
         // One card represents the loaded model; its other names only resolve lookups.
         // Bootstrap validated these capacities before serving; a text-only package has none.
-        let limits = model
+        let limits = image_limits.or_else(|| model
             .contract
             .vision
             .enabled()
             .then(|| super::config::image_limits(&model.contract.vision, model.limits.max_sequence_tokens).ok())
-            .flatten();
+            .flatten());
         // Match vLLM's ModelCard / ModelPermission wire fields while
         // advertising only features supported by this server.
         let card = json!({
@@ -94,7 +95,7 @@ impl ModelCatalog {
     }
 }
 
-pub(super) fn router<S>(model: &ModelConfig, served_names: &[String]) -> Router<S>
+pub(super) fn router<S>(model: &ModelConfig, served_names: &[String], image_limits: Option<crate::frontend::images::ImageLimits>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -102,7 +103,7 @@ where
         .route("/v1/models", get(list))
         // A wildcard also accepts repository IDs such as organization/model.
         .route("/v1/models/{*model}", get(retrieve))
-        .with_state(Arc::new(ModelCatalog::new(model, served_names)))
+        .with_state(Arc::new(ModelCatalog::new(model, served_names, image_limits)))
 }
 
 async fn list(State(catalog): State<Arc<ModelCatalog>>) -> Json<Value> {
@@ -179,7 +180,7 @@ mod tests {
     #[test]
     fn metadata_reports_effective_limits_and_prepared_modalities() {
         let mut model = config();
-        let text = ModelCatalog::new(&model, &[]).card;
+        let text = ModelCatalog::new(&model, &[], None).card;
         assert_eq!(text["max_model_len"], 8192);
         assert_eq!(text["flare"]["max_concurrency"], 3);
         assert_eq!(text["flare"]["prefill_chunk_size"], 512);
@@ -204,7 +205,7 @@ mod tests {
 
         assert_eq!(text["flare"]["max_top_logprobs"], 0);
         model.max_top_logprobs = crate::execution::MAX_TOP_LOGPROBS;
-        let logprobs = ModelCatalog::new(&model, &[]).card;
+        let logprobs = ModelCatalog::new(&model, &[], None).card;
         assert_eq!(logprobs["permission"][0]["allow_logprobs"], true);
         assert_eq!(logprobs["flare"]["max_top_logprobs"], crate::execution::MAX_TOP_LOGPROBS);
         model.limits.max_sequence_tokens = 4096;
@@ -215,7 +216,7 @@ mod tests {
             patches_per_feature: 4,
             patch_capacities: vec![1024],
         };
-        let vision = ModelCatalog::new(&model, &[]).card;
+        let vision = ModelCatalog::new(&model, &[], None).card;
         assert_eq!(vision["max_model_len"], 4096);
         assert_eq!(
             vision["flare"]["input_modalities"],
@@ -237,6 +238,20 @@ mod tests {
     }
 
     #[test]
+    fn discovery_reports_the_loaded_processor_image_limit() {
+        let mut model = config();
+        model.contract.vision = VisionCapabilities { feature_slots: 1, max_images: 1,
+            features_per_request: 2048, patches_per_feature: 4,
+            patch_capacities: vec![256, 1024, 4096, 8192] };
+        let mut limits = super::super::config::image_limits(&model.contract.vision, 8192).unwrap();
+        limits.max_images = 20;
+        let card = ModelCatalog::new(&model, &[], Some(limits)).card;
+        assert_eq!(card["flare"]["max_images_per_prompt"], 20);
+        assert_eq!(card["flare"]["max_image_tokens_per_prompt"], 8192);
+        assert_eq!(card["flare"]["max_image_tokens_per_image"], 2048);
+    }
+
+    #[test]
     fn discovery_uses_the_first_nonempty_alias_or_checkpoint_id() {
         for (aliases, expected) in [
             (vec![], "organization/model"),
@@ -245,7 +260,7 @@ mod tests {
             (vec!["organization/model", "alias"], "organization/model"),
         ] {
             let aliases = aliases.into_iter().map(String::from).collect::<Vec<_>>();
-            let catalog = ModelCatalog::new(&config(), &aliases);
+            let catalog = ModelCatalog::new(&config(), &aliases, None);
             assert_eq!(catalog.card["id"], expected);
             assert_eq!(catalog.card["root"], "organization/model");
             assert!(catalog.names.contains("organization/model"));
@@ -287,7 +302,7 @@ mod tests {
             "alias with space",
         ]
         .map(String::from);
-        let router = router::<()>(&config(), &aliases);
+        let router = router::<()>(&config(), &aliases, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

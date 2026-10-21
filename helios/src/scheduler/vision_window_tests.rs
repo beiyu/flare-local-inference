@@ -15,6 +15,15 @@ fn scheduler_with_resources(
     active: usize,
     snapshots: u32,
 ) -> RequestScheduler {
+    scheduler_with_state_rows(page_tokens, Some(rows), active, snapshots)
+}
+
+fn scheduler_with_state_rows(
+    page_tokens: usize,
+    rows: Option<usize>,
+    active: usize,
+    snapshots: u32,
+) -> RequestScheduler {
     let mut scheduler = RequestScheduler::new(
         [19; 32],
         SchedulerLimits {
@@ -37,7 +46,7 @@ fn scheduler_with_resources(
             },
             draft_pages_per_request: 1,
             completion_inputs: vec![],
-            state_rows_per_request: Some(rows),
+            state_rows_per_request: rows,
         },
     )
     .unwrap();
@@ -230,6 +239,93 @@ fn cold_history_exceeding_two_arenas_keeps_pages_state_and_user_reuse_across_win
         assert!(scheduler.finish(handle).unwrap().is_some());
         assert_eq!(scheduler.stats().snapshot_publications, 1);
     }
+}
+
+#[test]
+fn atomic_image_windows_preserve_exact_boundaries_for_every_cache_storage_shape() {
+    for page_tokens in [64, 128, 256, 1024] {
+        for rows in [None, Some(1), Some(4), Some(8)] {
+            for counts in [&[2048, 16][..], &[1024, 1024, 16][..]] {
+                let mut scheduler = scheduler_with_state_rows(page_tokens, rows, 1, 16);
+                scheduler.capabilities.vision.features_per_request = 2048;
+                let (mut token, mut feature) = (17, 0);
+                let images = counts.iter().map(|&count| {
+                    let input = ConditionedInput {
+                        token_span: token..token + count + 2,
+                        feature_range: feature..feature + count,
+                        patches: count * 4,
+                    };
+                    token = input.token_span.end;
+                    feature += count;
+                    input
+                }).collect::<Vec<_>>();
+                let spans = images.iter().map(|input| input.token_span.clone()).collect::<Vec<_>>();
+                let mut handle = scheduler.admit(specification(&images)).unwrap();
+                scheduler.set_prefill_spans(handle, &spans).unwrap();
+                scheduler.set_conditioned_inputs(handle, &images).unwrap();
+                let request = scheduler.request(handle).unwrap();
+                assert_eq!(request.conditioned_windows.len(), 2);
+                assert_eq!(request.conditioned_windows[0].inputs, 0..images.len() - 1);
+                let boundary = images.last().unwrap().token_span.start;
+                assert_eq!(request.conditioned_windows[0].prefill_end, boundary);
+                assert_eq!(request.conditioned_windows[1].token_start, boundary);
+                let state = request.state_slot;
+                let slot = request.image_slot;
+                let mut restores = 0;
+                let mut prefilled = 0;
+                for _ in 0..100 {
+                    let request = scheduler.request(handle).unwrap();
+                    if request.phase == RequestPhase::Finishing { break; }
+                    if request.conditioned_window_ready() {
+                        assert_eq!(request.consumed_tokens, boundary as u64);
+                        assert_ne!(boundary % page_tokens, 0);
+                        let pages = request.pages().collect::<Vec<_>>();
+                        let reserved = request.reserved_pages.clone();
+                        let snapshot = request.window_snapshot;
+                        let previous = handle;
+                        handle = scheduler.resume_conditioned_window(handle).unwrap();
+                        let restored = scheduler.request(handle).unwrap();
+                        assert_eq!(handle.generation, previous.generation + 1);
+                        assert_eq!(restored.state_slot, state);
+                        assert_eq!(restored.image_slot, slot);
+                        assert_eq!(restored.pages().collect::<Vec<_>>(), pages);
+                        assert_eq!(restored.reserved_pages, reserved);
+                        assert_eq!(restored.prefix_snapshot(), snapshot);
+                        assert_eq!(restored.feature_index(2048).unwrap(), 0);
+                        assert!(restored.feature_index(0).is_err());
+                        restores += 1;
+                    }
+                    let executed = step(&mut scheduler, handle);
+                    if executed.kind == GraphKind::Prefill {
+                        let lane = &executed.lanes[0];
+                        assert_eq!(lane.start_position as usize, prefilled);
+                        prefilled += lane.tokens;
+                        assert!(!spans.iter().any(|span| span.start < prefilled && prefilled < span.end));
+                    }
+                }
+                assert_eq!(restores, 1);
+                assert_eq!(prefilled, token + 23);
+                assert_eq!(scheduler.request(handle).unwrap().phase, RequestPhase::Finishing);
+                assert_eq!(scheduler.stats().reused_tokens, 0);
+                assert!(scheduler.finish(handle).unwrap().is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn conditioned_windows_still_reject_an_atomic_span_crossing_the_feature_capacity() {
+    let mut scheduler = scheduler(64, 4);
+    scheduler.capabilities.vision.features_per_request = 2048;
+    let images = [ConditionedInput { token_span: 17..1041, feature_range: 0..1024, patches: 4096 },
+        ConditionedInput { token_span: 1041..2065, feature_range: 1024..2048, patches: 4096 },
+        ConditionedInput { token_span: 2065..2081, feature_range: 2048..2064, patches: 64 }];
+    let handle = scheduler.admit(specification(&images)).unwrap();
+    scheduler.set_prefill_spans(handle, &[17..2081]).unwrap();
+    assert!(scheduler.set_conditioned_inputs(handle, &images).unwrap_err().to_string()
+        .contains("cannot split atomic prefill spans"));
+    assert_eq!(scheduler.request(handle).unwrap().last_use, Fence(0));
+    assert_eq!(scheduler.request(handle).unwrap().image_slot, None);
 }
 
 #[test]

@@ -12,6 +12,41 @@ def host_identity():
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
+def discover_roce_devices(root=Path("/sys/class/infiniband")):
+    """Match Helios RoCE discovery: active port 1, RoCEv2 and IPv4-mapped GIDs."""
+    root = Path(root)
+
+    def read(path):
+        try:
+            return path.read_text().strip()
+        except (OSError, UnicodeError):
+            return None
+
+    try:
+        names = sorted(entry.name for entry in root.iterdir()
+            if "ACTIVE" in (read(entry / "ports/1/state") or ""))
+    except OSError as error:
+        raise RuntimeError(f"cannot list RDMA devices in {root}: {error}") from error
+
+    def eligible(name, index):
+        port = root / name / "ports/1"
+        if (read(port / f"gid_attrs/types/{index}") or "").lower() != "roce v2":
+            return False
+        gid = (read(port / f"gids/{index}") or "").replace(":", "")
+        if len(gid) != 32 or gid[:20] != "0" * 20 or gid[20:24].lower() != "ffff":
+            return False
+        try:
+            return 0 <= int(gid[24:], 16) <= 0xffffffff
+        except ValueError:
+            return False
+
+    gid_index = (3 if names and all(eligible(name, 3) for name in names)
+        else next((index for index in range(16) if any(eligible(name, index) for name in names)), None))
+    if gid_index is None:
+        raise RuntimeError("no active RDMA device has a RoCEv2 IPv4 GID")
+    return [name for name in names if eligible(name, gid_index)][:4], gid_index
+
+
 def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, gather_bytes, package_storage=None,
                         varlen_bytes=0, ring=False):
     """Allocate RoCEnante for ranks on separate DGX Sparks: BF16 hidden reductions and logit gathers.
@@ -41,9 +76,10 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         lambda size: package_storage.host_allocate("roce", (size,), torch.uint8).host_view)
     if type(varlen_bytes) is not int or varlen_bytes < 0 or varlen_bytes % 16:
         raise ValueError("variable-length gather capacity must be a nonnegative multiple of 16 bytes")
+    hca_names, gid_index = discover_roce_devices()
     runtime = roce.AllReduce(exchange_group=group, device=device, max_size=nbytes, max_gather_bytes=gather_bytes,
                              pipe_bytes=pipe_bytes, region_allocator=region,
-                             ring=ring,
+                             ring=ring, hca_names=hca_names, gid_index=gid_index,
                              **({"max_varlen_bytes": varlen_bytes} if varlen_bytes else {}))
     if package_storage is not None:
         package_storage.transports.append(runtime)

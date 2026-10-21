@@ -2,9 +2,11 @@
 
 from array import array
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import struct
 from types import SimpleNamespace
@@ -32,10 +34,17 @@ def checkpoint(directory):
 
 
 @contextmanager
-def connected(tmp_path):
+def connected(tmp_path, *, local=False, local_name="original", mutate_local=None, progress=None):
     original = tmp_path / "original"
     offset = checkpoint(original)
     description = SimpleNamespace(repository=str(original), revision="immutable")
+    local_snapshot = None
+    if local:
+        local_snapshot = tmp_path / "peer" / local_name
+        local_snapshot.parent.mkdir()
+        shutil.copytree(original, local_snapshot)
+        if mutate_local is not None:
+            mutate_local(local_snapshot, offset)
     root = transport.RootSource(original, description)
     sender, receiver = socket.socketpair()
     sender.settimeout(5)
@@ -44,7 +53,8 @@ def connected(tmp_path):
     server.thread.start()
     client = None
     try:
-        client = transport.RemoteSource(receiver, b"k" * 32, 1, "code", description, directory=tmp_path)
+        client = transport.RemoteSource(receiver, b"k" * 32, 1, "code", description, directory=tmp_path,
+                                        local_snapshot=local_snapshot, progress=progress)
         server.wait_ready()
         yield client, server, offset
         if not client.finished and server.error is None:
@@ -321,6 +331,7 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
 
     events = []
     class Owner:
+        local = None
         stats = dict(payload_bytes=0, metadata_bytes=0, requests=0)
         @contextlib.contextmanager
         def activate(self):
@@ -382,3 +393,179 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
         signal.signal(signal.SIGINT, previous)
     assert events.count("owner-closed") == 1
     assert events.index("drained") < events.index("package-sent") < events.index("owner-closed")
+
+
+def test_verified_local_mirror_uses_pinned_files_without_remote_tensor_reads(tmp_path):
+    with connected(tmp_path, local=True) as (client, server, start):
+        assert client.local is not None
+        local = client.local.snapshot
+        assert local == tmp_path / "peer" / "original"
+        assert client.local.catalog == server.source.catalog
+        assert client.stats == server.stats and client.stats["payload_bytes"] == 0
+        before = dict(client.stats)
+        with client.activate() as snapshot:
+            assert snapshot == client.snapshot and snapshot != local
+            assert transport.source_for(snapshot) is client
+            assert transport._OWNER.get() is client
+            assert not (snapshot / "weights.safetensors").exists()
+            manifest = inspect_indexed_checkpoint(snapshot)
+            tensor = manifest.tensors["selected"]
+            assert client.read(tensor.shard, start, tensor.nbytes) == bytes(range(32))
+            assert transport.source_size(snapshot / tensor.shard) == (local / tensor.shard).stat().st_size
+        assert client.stats == before
+        assert client.local_stats == dict(payload_bytes=32, metadata_bytes=0, requests=1)
+        client.finish()
+        server.join()
+        assert server.stats == before
+        temporary, owner = client.temporary.name, client.local
+        descriptors = [held.descriptor for held in owner.files.values()]
+        client.close()
+        assert not Path(temporary).exists() and local.is_dir() and not owner.files
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+
+
+def test_local_same_header_different_payload_is_rejected_before_ready(tmp_path):
+    def change(snapshot, offset):
+        with (snapshot / "weights.safetensors").open("r+b") as output:
+            output.seek(offset)
+            output.write(b"!")
+    with pytest.raises(ValueError, match="whole-file SHA256 differs"):
+        with connected(tmp_path, local=True, mutate_local=change):
+            pytest.fail("a different local payload was admitted")
+    assert not list(tmp_path.glob("flare-checkpoint-*"))
+    assert (tmp_path / "peer" / "original" / "weights.safetensors").is_file()
+
+
+@pytest.mark.parametrize("difference", ("metadata", "missing", "extra", "name"))
+def test_local_catalog_must_match_every_authenticated_entry_and_name(tmp_path, difference):
+    def change(snapshot, _):
+        if difference == "metadata":
+            (snapshot / "config.json").write_text('{"different": true}')
+        elif difference == "missing":
+            (snapshot / "model.safetensors.index.json").unlink()
+        elif difference == "extra":
+            (snapshot / "unlisted").write_bytes(b"extra")
+    with pytest.raises(ValueError, match="local checkpoint catalog differs"):
+        with connected(tmp_path, local=True, local_name="other" if difference == "name" else "original",
+                       mutate_local=change):
+            pytest.fail("a different local catalog was admitted")
+    assert not list(tmp_path.glob("flare-checkpoint-*"))
+
+
+@pytest.mark.parametrize("replace_file", (False, True))
+def test_local_file_changes_after_hash_are_rejected_at_finish(tmp_path, replace_file):
+    local = None
+    with pytest.raises(RuntimeError, match="changed after admission"):
+        with connected(tmp_path, local=True) as (client, _, start):
+            local = client.local.snapshot
+            file = local / "weights.safetensors"
+            if replace_file:
+                replacement = local / "replacement"
+                replacement.write_bytes(file.read_bytes())
+                replacement.replace(file)
+            else:
+                with file.open("r+b") as output:
+                    output.seek(start)
+                    output.write(b"!")
+            client.finish()
+    assert local.is_dir()
+    assert not list(tmp_path.glob("flare-checkpoint-*"))
+
+
+def test_whole_file_digest_is_bounded_and_releases_completed_pages(tmp_path, monkeypatch):
+    original = tmp_path / "original"
+    checkpoint(original)
+    root = transport.RootSource(original, SimpleNamespace(repository=str(original), revision="immutable"))
+    try:
+        expected = hashlib.sha256((original / "weights.safetensors").read_bytes()).hexdigest()
+        pread = os.pread
+        reads = []
+        def read(descriptor, count, offset):
+            reads.append((descriptor, count, offset))
+            return pread(descriptor, count, offset)
+        monkeypatch.setattr(transport, "BLOCK_BYTES", 4096)
+        monkeypatch.setattr(os, "pread", read)
+        with mock.patch.object(transport, "release_read_pages") as release:
+            assert root.digest("weights.safetensors") == expected
+        assert len(reads) > 1 and max(count for _, count, _ in reads) <= 4096
+        assert [call.args for call in release.call_args_list] == [
+            (descriptor, offset, count) for descriptor, count, offset in reads]
+    finally:
+        root.close()
+
+
+def test_whole_file_digest_rejects_mutation_during_hash(tmp_path, monkeypatch):
+    original = tmp_path / "original"
+    start = checkpoint(original)
+    root = transport.RootSource(original, SimpleNamespace(repository=str(original), revision="immutable"))
+    try:
+        pread = os.pread
+        changed = False
+        def read(descriptor, count, offset):
+            nonlocal changed
+            content = pread(descriptor, count, offset)
+            if not changed:
+                changed = True
+                with (original / "weights.safetensors").open("r+b") as output:
+                    output.seek(start)
+                    output.write(b"!")
+            return content
+        monkeypatch.setattr(os, "pread", read)
+        with pytest.raises(RuntimeError, match="changed after admission"):
+            root.digest("weights.safetensors")
+    finally:
+        root.close()
+
+
+def test_local_pinned_descriptor_survives_a_temporary_symlink_retarget(tmp_path, monkeypatch):
+    original_target = tmp_path / "original-payload"
+    replacement = tmp_path / "replacement-payload"
+    def link_local(snapshot, offset):
+        file = snapshot / "weights.safetensors"
+        shutil.copyfile(file, original_target)
+        shutil.copyfile(file, replacement)
+        with replacement.open("r+b") as output:
+            output.seek(offset)
+            output.write(b"!" * 32)
+        file.unlink()
+        file.symlink_to(original_target)
+    with connected(tmp_path, local=True, mutate_local=link_local) as (client, server, start):
+        held = client.local.files["weights.safetensors"]
+        pread = os.pread
+        reads = []
+        def read(descriptor, count, offset):
+            if descriptor != held.descriptor:
+                return pread(descriptor, count, offset)
+            held.path.unlink()
+            held.path.symlink_to(replacement)
+            try:
+                with held.path.open("rb") as reopened:
+                    reopened.seek(start)
+                    assert reopened.read(32) == b"!" * 32
+                content = pread(descriptor, count, offset)
+                reads.append(content)
+                return content
+            finally:
+                held.path.unlink()
+                held.path.symlink_to(original_target)
+        monkeypatch.setattr(os, "pread", read)
+        before = dict(client.stats)
+        with client.activate():
+            assert client.read("weights.safetensors", start, 32) == bytes(range(32))
+            assert client.read("weights.safetensors", start, 32) == bytes(range(32))
+        assert reads == [bytes(range(32)), bytes(range(32))]
+        assert client.local_stats == dict(payload_bytes=64, metadata_bytes=0, requests=2)
+        assert client.stats == server.stats == before
+        client.finish()
+
+
+def test_local_validation_progress_reports_totals_without_digests(tmp_path):
+    messages = []
+    with connected(tmp_path, local=True, progress=messages.append) as (client, server, _):
+        assert messages[0].startswith("verify local checkpoint: 0/3 files")
+        assert messages[-1].startswith("verified local checkpoint: 3/3 files")
+        for name in client.local.files:
+            assert client.local.digest(name) not in " ".join(messages)
+        assert client.stats == server.stats and client.stats["payload_bytes"] == 0

@@ -153,7 +153,7 @@ hardware contract on the source host, run `flare inspect PRIMARY --plain`.
 
 | Artifact | Preparation rank zero / source host | Peer host |
 | --- | --- | --- |
-| Source checkpoint | Complete checkpoint in its hub cache or local directory | Requests only the source ranges its loader needs during preparation |
+| Source checkpoint | Complete checkpoint in its hub cache or local directory | Requests required ranges, or reads an explicitly selected local copy after whole-file verification |
 | Export data | Collects rank manifests and requests payload files absent from its cache | Prepares and retains its rank's payload blobs locally |
 | Serving package | Complete package on serving rank zero; an external source may also retain a complete copy | Required rank payloads and shared data |
 | Serving executable | Installed agent binary by default | Installed agent binary by default |
@@ -200,6 +200,17 @@ On `hertz`:
 ```sh
 .venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 2
 ```
+
+When the peer already has the same checkpoint, add
+`--local-checkpoint /absolute/path/to/checkpoint` to `ignition join`. The directory
+must contain the same relative files and snapshot basename, including custom
+templates and any transplanted weights. Admission authenticates rank zero's
+catalog and compares complete SHA256 file contents on both hosts before loading.
+A mismatch fails explicitly. Successful local admission uses the ordinary local
+weight reader; model tensor payloads are not transferred from rank zero. Full
+verification still reads the checkpoint from disk once on each host. Omitting
+the option retains authenticated remote range loading.
+
 
 For four hosts, use `--ranks 4` and start peer ranks 1, 2, and 3. Rank zero
 admits each peer once, serves checkpoint metadata and selected byte ranges,

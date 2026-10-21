@@ -4,6 +4,23 @@ import json
 from pathlib import Path
 
 
+def validate_linear_attention_config(text):
+    """Accept the original nested schema and older flattened ModelOpt metadata."""
+    from collections.abc import Mapping
+
+    nested = text.get("linear_attn_config", {})
+    if not isinstance(nested, Mapping):
+        raise ValueError("GLM linear_attn_config must be a mapping")
+    for flat, key, expected in (
+        ("linear_num_heads", "num_heads", 64),
+        ("linear_head_dim", "head_dim", 128),
+        ("linear_conv_kernel_dim", "short_conv_kernel_size", 4),
+    ):
+        values = [mapping[name] for mapping, name in ((text, flat), (nested, key)) if name in mapping]
+        if not values or any(type(value) is not int or value != expected for value in values):
+            raise ValueError(f"GLM {flat}/linear_attn_config.{key} requires {expected}, got {values}")
+
+
 def create_model_tree(snapshot: Path):
     """Construct the canonical tree on meta storage, without checkpoint transfers.
 

@@ -112,8 +112,15 @@ pub fn prepare_image_inputs(
         for ((input, geometry), (original, additional)) in inputs.into_iter().zip(&geometry)
             .zip(&prepared.token_expansions) {
             let start = original + expansion_offset;
+            let mut token_span = start..start + additional + 1;
+            for atomic in &prepared.data.spans {
+                if atomic.start < token_span.end && token_span.start < atomic.end {
+                    token_span.start = token_span.start.min(atomic.start);
+                    token_span.end = token_span.end.max(atomic.end);
+                }
+            }
             prepared.conditioned_inputs.push(crate::frontend::images::PreparedImageInput::new(
-                input, start..start + additional + 1,
+                input, token_span,
                 feature_offset..feature_offset + geometry.tokens, processor.clone(),
             ));
             feature_offset += geometry.tokens;
@@ -400,9 +407,14 @@ mod tests {
             let images = (0..3).map(|i| RgbImage::new(64, 64, vec![i; 64 * 64 * 3]).unwrap()).collect();
             let prepared = prepare_input(&config, &frontend, Some(&processor), &rendered, images).unwrap();
             assert_eq!(prepared.conditioned_inputs.len(), 3, "{layout:?}");
+            let mut shift = 0;
             for (index, input) in prepared.conditioned_inputs.iter().enumerate() {
                 assert_eq!(input.feature_range, index * geometry.tokens..(index + 1) * geometry.tokens);
                 assert_eq!(input.geometry, geometry);
+                let (original, additional) = prepared.token_expansions[index];
+                assert_eq!(input.token_span, original + shift..original + shift + additional + 1,
+                    "{layout:?}");
+                shift += additional;
             }
             assert_eq!(prepared.data.vision_token_indices.iter().copied().max(), Some((3 * geometry.tokens - 1) as i32));
             assert_eq!(processor.preparation_counts().prepared_images, 0);
@@ -464,9 +476,43 @@ mod tests {
         assert_eq!(processor.preparation_counts().prepared_images, 0);
         for (i, input) in prepared.conditioned_inputs.iter().enumerate() {
             assert_eq!(input.feature_range, i * 16..(i + 1) * 16);
-            assert_eq!(input.token_span, 2 + i * 18..18 + i * 18);
-            assert_eq!(prepared.data.spans[i], 1 + i * 18..19 + i * 18);
+            assert_eq!(input.token_span, 1 + i * 18..19 + i * 18);
+            assert_eq!(prepared.data.spans[i], input.token_span);
+            assert_eq!(prepared.conditioning[i].position, (2 + i * 18) as u64);
+            assert_eq!(prepared.token_expansions[i], (2 + i * 3, 15));
+            assert_eq!(prepared.data.vision_token_indices[input.token_span.start], -1);
+            assert_eq!(prepared.data.vision_token_indices[input.token_span.end - 1], -1);
+            assert_eq!(prepared.data.vision_token_indices[input.token_span.start + 1..input.token_span.end - 1],
+                (i * 16..(i + 1) * 16).map(|n| n as i32).collect::<Vec<_>>());
         }
+        let descriptions = prepared.conditioned_inputs.iter().map(|image| crate::scheduler::ConditionedInput {
+            token_span: image.token_span.clone(), feature_range: image.feature_range.clone(),
+            patches: image.geometry.patches,
+        }).collect::<Vec<_>>();
+        for page_tokens in [64, 128, 256, 1024] {
+            for rows in [None, Some(1), Some(4), Some(8)] {
+                for capacity in [16, 2048] {
+                    let mut capabilities = crate::model::scheduler_capabilities(&config);
+                    capabilities.page_tokens = page_tokens;
+                    capabilities.state_rows_per_request = rows;
+                    capabilities.vision.features_per_request = capacity;
+                    let mut scheduler = crate::scheduler::RequestScheduler::new(config.identity,
+                        config.limits, capabilities).unwrap();
+                    let handle = scheduler.admit(crate::scheduler::RequestSpec {
+                        prompt: prepared.tokens.clone(), conditioning: prepared.conditioning.clone(),
+                        message_boundaries: vec![], max_new_tokens: 1, grammar_constrained: false,
+                        host_stops: false, growable_output: false,
+                    }).unwrap();
+                    scheduler.set_prefill_spans(handle, &prepared.data.spans).unwrap();
+                    scheduler.set_conditioned_inputs(handle, &descriptions).unwrap();
+                    assert_eq!(scheduler.request(handle).unwrap().conditioned_input_end(),
+                        if capacity == 16 { 1 } else { 20 });
+                }
+            }
+        }
+        let mut overlapping = prepared.conditioned_inputs.clone();
+        overlapping[0].token_span.end = overlapping[1].token_span.end;
+        assert!(validate_conditioned_inputs(&config, &prepared.tokens, &prepared.data, &overlapping).is_err());
         let first = prepared.conditioned_inputs[0].materialize().unwrap();
         let second = prepared.conditioned_inputs[1].materialize().unwrap();
         assert_ne!(first.pixel_values, second.pixel_values);

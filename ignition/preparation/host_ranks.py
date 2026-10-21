@@ -583,7 +583,7 @@ def knock(address, rank, world, *, identity, topology, timeout=600.0, report=Non
 
 def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, export_staging=None,
                package_cache=None,
-               checkpoint_token_file="~/.config/flare/agent.token", identity=None):
+               checkpoint_token_file="~/.config/flare/agent.token", identity=None, local_checkpoint=None):
     """Prepare one peer from owned checkpoint metadata and requested source ranges, report
     memory, and serve until coordinated drain.
 
@@ -607,7 +607,10 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
         _, checkpoint = command
         source = RemoteSource(control, token(checkpoint_token_file), rank,
                               source_identity() if identity is None else identity, checkpoint,
-                              directory=export_staging, on_created=owned_sources.append)
+                              directory=export_staging, on_created=owned_sources.append,
+                              local_snapshot=local_checkpoint, progress=progress)
+        if local_checkpoint is not None and progress is not None:
+            progress(f"Authenticated local checkpoint: {source.local.snapshot}")
         source_scope = source.activate()
         snapshot = source_scope.__enter__()
         assignment = receive_object(control)
@@ -636,8 +639,13 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
             model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD, progress=progress)
         source.finish()
         model.memory_report["checkpoint_source"] = dict(source.stats)
+        if source.local is not None:
+            model.memory_report["checkpoint_source"]["local"] = dict(source.local_stats)
         if progress is not None:
-            progress(f"received {source.stats['payload_bytes'] / (1 << 30):.2f} GiB of checkpoint ranges")
+            if source.local is not None:
+                progress("loaded checkpoint from authenticated local files; no remote tensor payloads")
+            else:
+                progress(f"received {source.stats['payload_bytes'] / (1 << 30):.2f} GiB of checkpoint ranges")
         model.manifest()
         send_object(control, {"report": model.memory_report})
         command = receive_object(control)

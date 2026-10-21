@@ -172,7 +172,7 @@ pub(super) async fn generate(
         let _permit = permit;
         let _ingress = preparation_ingress;
         let body = decode_body(&bytes, &encoding, prepare_state.max_body_bytes)?;
-        let decoded = protocol::decode(protocol, body, count)
+        let decoded = protocol::decode_with_stop_scope(protocol, body, count, prepare_state.default_stop_scope)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         let tool_grammars = decoded
             .request
@@ -324,7 +324,7 @@ pub(super) async fn generate(
     let mut encoder = Encoder::new(
         protocol,
         id.clone(),
-        state.model.config().model_id.clone(),
+        state.response_model.clone(),
         created,
         decoded.request.choices,
         prompt_usage,

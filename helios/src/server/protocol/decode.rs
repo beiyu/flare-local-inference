@@ -588,6 +588,15 @@ fn generation_logprobs(protocol: Protocol, body: &Value) -> Result<Option<Logpro
     Ok(enabled.then_some(LogprobOptions { top, token_ids }))
 }
 
+pub(crate) fn decode_with_stop_scope(
+    protocol: Protocol, body: Value, count: bool, default: StringStopScope,
+) -> Result<Decoded> {
+    let omitted = body.get("stop_scope").is_none_or(Value::is_null);
+    let mut decoded = decode(protocol, body, count)?;
+    if omitted { decoded.request.options.stop_scope = default; }
+    Ok(decoded)
+}
+
 pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Decoded> {
     body.as_object().ok_or("request must be a JSON object")?;
     reject(
@@ -803,6 +812,29 @@ mod tests {
         }
     }
     #[test]
+    fn server_string_stop_scope_defaults_yield_to_explicit_request_values() {
+        for (protocol, input) in [
+            (Protocol::Chat, json!({"messages":[{"role":"user","content":"hello"}]})),
+            (Protocol::Messages, json!({"max_tokens":8,"messages":[{"role":"user","content":"hello"}]})),
+            (Protocol::Responses, json!({"input":"hello"})),
+            (Protocol::Completions, json!({"prompt":"hello"})),
+        ] {
+            for default in [StringStopScope::All, StringStopScope::AfterReasoning] {
+                assert_eq!(decode_with_stop_scope(protocol, input.clone(), false, default).unwrap().request.options.stop_scope, default);
+                for (value, expected) in [
+                    (Value::Null, default), (json!("all"), StringStopScope::All),
+                    (json!("after_reasoning"), StringStopScope::AfterReasoning),
+                ] {
+                    let mut body = input.clone(); body["stop_scope"] = value;
+                    assert_eq!(decode_with_stop_scope(protocol, body, false, default).unwrap().request.options.stop_scope, expected);
+                }
+                let mut body = input.clone(); body["stop_scope"] = json!("invalid");
+                assert!(decode_with_stop_scope(protocol, body, false, default).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn string_stop_scope_is_explicit_and_shared_by_every_protocol() {
         for (protocol, input) in [
             (
@@ -882,6 +914,10 @@ mod native_prompt_tests {
     use tokenizers::{AddedToken, Tokenizer};
 
     fn native(encoder: PromptEncoder) -> (Frontend, GrammarCompiler, crate::model::ModelConfig) {
+        native_with_opener(encoder, true)
+    }
+
+    fn native_with_opener(encoder: PromptEncoder, special: bool) -> (Frontend, GrammarCompiler, crate::model::ModelConfig) {
         let mut alphabet: Vec<_> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
             .into_iter()
             .collect();
@@ -912,6 +948,7 @@ mod native_prompt_tests {
             ]
             .map(|s| AddedToken::from(s, true)),
         ).unwrap();
+        tokenizer.add_tokens([AddedToken::from("<tool_call>", special).normalized(false)]).unwrap();
         let eos = tokenizer.token_to_id("<｜end▁of▁sentence｜>").unwrap();
         let bytes = tokenizer.to_string(false).unwrap();
         let path = std::env::temp_dir().join(format!(
@@ -950,6 +987,72 @@ mod native_prompt_tests {
         )
         .unwrap();
         (frontend, compiler, config)
+    }
+
+    #[test]
+    fn tool_choice_none_preserves_tools_and_masks_the_prepared_added_opener() {
+        for special in [false, true] {
+            check_tool_choice_none_added_opener(special);
+        }
+    }
+
+    fn check_tool_choice_none_added_opener(special: bool) {
+        use crate::model::contract::{ToolParser, ToolParserKind};
+        let (frontend, compiler, mut config) = native_with_opener(PromptEncoder::DeepseekV4, special);
+        config.contract.frontend.tools = Some(ToolParser {
+            kind: ToolParserKind::GlmArgumentTags, wrapping_newlines: 0, tag_separator: String::new(),
+        });
+        for (protocol, input, tools, choice) in [
+            (Protocol::Chat, json!({"messages":[{"role":"user","content":"hello"}]}),
+             json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]), json!("none")),
+            (Protocol::Messages, json!({"max_tokens":8,"messages":[{"role":"user","content":"hello"}]}),
+             json!([{"name":"lookup","input_schema":{"type":"object"}}]), json!({"type":"none"})),
+            (Protocol::Responses, json!({"input":"hello"}),
+             json!([{"type":"function","name":"lookup","parameters":{"type":"object"}}]), json!("none")),
+        ] {
+            let mut body = input;
+            body["model"] = config.model_id.clone().into(); body["tools"] = tools; body["tool_choice"] = choice;
+            let mut request = decode(protocol, body, false).unwrap().request;
+            let prepare = |request: &Request| crate::server::request::prepare_inference(
+                &frontend, None, &compiler, &config, request, 0, false).unwrap();
+            let none = prepare(&request);
+            request.tool_choice = ToolChoice::Auto;
+            let auto = prepare(&request);
+            assert_eq!(none.prompt.tokens, auto.prompt.tokens, "{protocol:?}");
+            assert_eq!(none.rendered_prompt, auto.rendered_prompt);
+            assert!(none.rendered_prompt.contains("lookup"));
+            assert!(auto.prompt.grammar.is_none());
+            assert_eq!(none.output.as_ref().unwrap().content.tools.len(), 1);
+            let opener = frontend.tokenizer().token_to_id("<tool_call>").unwrap();
+            let mut mask = none.prompt.grammar.unwrap();
+            assert!(!mask.is_structured());
+            assert_eq!(mask.mask()[opener as usize / 32] as u32 & (1 << (opener % 32)), 0);
+            let (legal, _) = mask.copy_masks(&[opener]).unwrap(); assert_eq!(legal, 0);
+            assert!(mask.advance(opener).is_err());
+            request.tool_choice = ToolChoice::None;
+            request.options.stops = vec!["STOP".into()];
+            request.options.stop_scope = StringStopScope::AfterReasoning;
+            request.options.ignore_eos = true;
+            let with_stop = prepare(&request);
+            assert!(with_stop.prompt.grammar.is_some());
+            assert!(with_stop.prompt.string_stop_reasoning.is_some());
+            assert_eq!(with_stop.prompt.stop_strings, ["STOP"]);
+            request.options.stops.clear(); request.options.token_stops = vec![vec![10]];
+            assert_eq!(prepare(&request).prompt.stop_sequences, [vec![10]]);
+        }
+    }
+
+    #[test]
+    fn tool_choice_none_rejects_a_composite_or_missing_special_opener() {
+        let (frontend, compiler, mut config) = native(PromptEncoder::DeepseekV4);
+        let body = json!({"model":config.model_id,"messages":[{"role":"user","content":"hello"}],
+            "tools":[{"type":"function","function":{"name":"lookup"}}],"tool_choice":"none"});
+        let request = decode(Protocol::Chat, body, false).unwrap().request;
+        // DSML's composite marker is ordinary byte tokens in this checkpoint.
+        let error = crate::server::request::prepare_inference(&frontend, None, &compiler, &config, &request, 0, false).err().unwrap();
+        assert!(error.to_string().contains("single dedicated"), "{error}");
+        config.contract.frontend.tools = None;
+        assert!(crate::server::request::prepare_inference(&frontend, None, &compiler, &config, &request, 0, false).is_err());
     }
 
     #[test]
@@ -1013,6 +1116,32 @@ mod native_prompt_tests {
                     assert_eq!(sampling.seed, u64::MAX);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn every_protocol_preserves_exact_greedy_when_the_prepared_range_includes_zero() {
+        use crate::model::{SamplingRange, SamplingRanges};
+        let (frontend, compiler, mut config) = native(PromptEncoder::DeepseekV4);
+        config.sampling_ranges = SamplingRanges {
+            temperature: Some(SamplingRange { min: 0., max: 1. }),
+            ..Default::default()
+        };
+        for (protocol, mut body) in [
+            (Protocol::Completions, json!({"prompt":"hello"})),
+            (Protocol::Chat, json!({"messages":[{"role":"user","content":"hello"}]})),
+            (Protocol::Messages, json!({"messages":[{"role":"user","content":"hello"}]})),
+            (Protocol::Responses, json!({"input":"hello"})),
+        ] {
+            body["model"] = config.model_id.clone().into();
+            body["max_tokens"] = 4.into();
+            body["max_output_tokens"] = 4.into();
+            body["temperature"] = 0.into();
+            let decoded = decode(protocol, body, false).unwrap();
+            let prepared = crate::server::request::prepare_inference(&frontend, None, &compiler,
+                &config, &decoded.request, 0, false).unwrap();
+            let s = prepared.prompt.sampling;
+            assert_eq!((s.temperature, s.top_k, s.top_p, s.min_p), (0., 1, 1., 0.), "{protocol:?}");
         }
     }
 

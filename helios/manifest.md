@@ -74,8 +74,15 @@ bindings address those partitions independently of transport slot indices.
 A loaded manifest contains only the selected graph
 variants, and scheduling chooses verification widths from those actual graphs.
 
-The sampling mode is `general` for every graph. Requests require a positive
-normal FP32 temperature and use the same stochastic sampling executable.
+The sampling mode is `general` for every graph. Requests use the captured general
+sampling executable with a positive normal FP32 temperature, or exact zero when
+the prepared sampling default is zero or its temperature range has minimum zero.
+That zero declaration requires the captured program's greedy path: apply penalties
+and grammar masks, select the maximum logit, and break ties by lowest token ID.
+Zero ignores top-k, top-p and min-p; it is not replaced with a small temperature.
+Positive subnormal execution temperatures are invalid. Previously exported
+packages with positive bounds retain HTTP clamping to their minimum, or their
+default when no range is declared, and reject zero in direct native admission.
 Unsupported mode strings reject manifest parsing before CUDA initialization.
 A model contract defines the required graph capacities.
 

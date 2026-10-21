@@ -2,7 +2,7 @@
 FROM rust:1.94-slim-bookworm
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       build-essential ca-certificates cmake git pkg-config protobuf-compiler libssl-dev \
+       build-essential ca-certificates cmake git pkg-config protobuf-compiler libssl-dev libibverbs-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 ENV CARGO_TARGET_DIR=/build/target CARGO_BUILD_JOBS=2

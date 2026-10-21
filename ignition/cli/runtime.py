@@ -38,6 +38,19 @@ def package_key(model, plan, no_compile):
               "speculation": None if plan.speculation is None else asdict(plan.speculation)}
     if plan.mla_compute_mode != "auto":
         inputs["mla_compute_mode"] = plan.mla_compute_mode
+    for field in ("exl3_library", "exl3_prefill_library"):
+        library_path = getattr(plan, field)
+        if library_path is not None:
+            with library_path.open("rb") as library:
+                inputs[field] = hashlib.file_digest(library, "sha256").hexdigest()
+    if plan.glm_vision_kernels is not None:
+        assets = []
+        for asset in sorted(plan.glm_vision_kernels.rglob("*")):
+            if asset.is_file() and (asset.name == "manifest.json" or asset.suffix == ".cubin"):
+                with asset.open("rb") as source:
+                    assets.append((asset.relative_to(plan.glm_vision_kernels).as_posix(),
+                                   hashlib.file_digest(source, "sha256").hexdigest()))
+        inputs["glm_vision_kernels"] = assets
     inputs["libraries"] = {name: metadata.version(name) for name in
                            ("torch", "transformers", "flashinfer-python", "cuda-python")}
     key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode())

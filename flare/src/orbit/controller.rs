@@ -803,8 +803,10 @@ impl Controller {
         if verify_weights && !serving.iter().any(|a| a == "--verify-weights") {
             serving.push("--verify-weights".into());
         }
-        let mut rank_zero = spec.as_ref().map_or_else(Vec::new, |s| s.rank_zero.clone());
-        rank_zero.extend(options.rank_zero.iter().cloned());
+        let rank_zero = merge_rank_zero_options(
+            spec.as_ref().map_or_else(Vec::new, |s| s.rank_zero.clone()),
+            &options.rank_zero,
+        );
         let roce_ring = options.roce_ring || spec.as_ref().is_some_and(|s| s.roce_ring);
         let gpus = if options.gpus.is_empty() {
             spec.as_ref().map_or_else(Vec::new, |s| s.gpus.clone())
@@ -2357,6 +2359,22 @@ pub fn compact_utc(seconds: u64) -> String {
     )
 }
 
+fn merge_rank_zero_options(saved: Vec<String>, explicit: &[String]) -> Vec<String> {
+    let overrides_names = explicit.iter().any(|argument|
+        argument == "--served-model-name" || argument.starts_with("--served-model-name="));
+    let mut result = Vec::new();
+    let mut saved = saved.into_iter();
+    while let Some(argument) = saved.next() {
+        if overrides_names && argument == "--served-model-name" {
+            saved.next();
+        } else if !overrides_names || !argument.starts_with("--served-model-name=") {
+            result.push(argument);
+        }
+    }
+    result.extend_from_slice(explicit);
+    result
+}
+
 /// The URL rank zero serves, from its `--host` and `--port` options or `flare run`'s defaults;
 /// an unspecified bind address is shown as its node's host.
 pub fn serving_url(rank_zero: &[String], node_address: &str) -> String {
@@ -2949,6 +2967,32 @@ mod tests {
                 parse_package_reference(local, is_node),
                 PackageReference::Local(local.into())
             );
+        }
+    }
+
+    #[test]
+    fn explicit_served_names_replace_saved_names_without_changing_other_rank_zero_options() {
+        use clap::Parser;
+        use crate::cli::{Cli, Command, OrbitCommand};
+        let saved = ["--host", "0.0.0.0", "--served-model-name", "saved-first",
+            "--served-model-name=saved-second", "--port", "8001"]
+            .map(str::to_owned).to_vec();
+        for names in [&[][..], &["new-first"][..], &["new-first", "spark/new-first"][..]] {
+            let mut arguments = vec!["flare", "orbit", "run", "model", "--port", "8002"];
+            for name in names { arguments.extend(["--served-model-name", name]); }
+            let Command::Orbit(orbit) = Cli::try_parse_from(arguments).unwrap().command else { panic!() };
+            let OrbitCommand::Run(orbit) = orbit.command else { panic!() };
+            let merged = merge_rank_zero_options(saved.clone(), &orbit.rank_zero_options());
+            let mut arguments = vec!["flare", "run", "model"];
+            arguments.extend(merged.iter().map(String::as_str));
+            let Command::Run(run) = Cli::try_parse_from(arguments).unwrap().command else { panic!() };
+            assert_eq!(run.served_model_name, if names.is_empty() {
+                vec!["saved-first", "saved-second"]
+            } else { names.to_vec() });
+            assert_eq!(run.host.to_string(), "0.0.0.0");
+            assert_eq!(run.port, 8002);
+            assert!(merged.windows(2).any(|pair| pair == ["--host", "0.0.0.0"]));
+            assert!(merged.windows(2).any(|pair| pair == ["--port", "8001"]));
         }
     }
 

@@ -1,4 +1,4 @@
-"""Adapt b12x's exact routed reads to an owned network checkpoint source."""
+"""Adapt b12x routed reads to authenticated remote or pinned local sources."""
 
 from array import array
 import os
@@ -7,7 +7,7 @@ import tempfile
 
 from b12x.loader._checkpoint import DirectWeightSession, TensorRange
 
-from .checkpoint_source import BLOCK_BYTES, row_extent, tensor_dtype
+from .checkpoint_source import BLOCK_BYTES, file_identity, row_extent, tensor_dtype
 
 
 def chunks(offset, width, rows, source_stride, destination, destination_stride, expand):
@@ -55,27 +55,45 @@ def destinations_overlap(left, right):
 
 
 class RemoteWeightSession(DirectWeightSession):
-    """Keep b12x routing and native copies while replacing only checkpoint reads.
+    """Keep b12x routing and native copies under the authenticated source owner.
 
-    Source IDs identify authenticated remote files, never local descriptors. Only
-    received bounded buffers have an O_DIRECT descriptor, private to this session.
+    Routed source IDs refer to admitted names. Local mirrors use inode-pinned
+    O_DIRECT descriptors; remote reads use a private bounded transfer buffer.
     """
 
     def __init__(self, source, manifest, *, device):
-        super().__init__(device=device, io_threads=1, read_mode="bounce")
+        if source.local is not None:
+            from ignition.components.weights import _checkpoint_read_mode
+
+            paths = (Path(f"/proc/self/fd/{source.local.files[source.name(manifest.snapshot / shard.path)].descriptor}")
+                     for shard in manifest.shards)
+            super().__init__(device=device, read_mode=_checkpoint_read_mode(paths))
+        else:
+            super().__init__(device=device, io_threads=1, read_mode="bounce")
         self.source, self.checkpoint = source, manifest
-        self.names = tuple(source.name(manifest.snapshot / shard.path) for shard in manifest.shards)
-        self.ids = {name: index for index, name in enumerate(self.names)}
-        self.shards = {name: shard.path for name, shard in zip(self.names, manifest.shards, strict=True)}
-        self.buffer_directory = tempfile.TemporaryDirectory(prefix="read-", dir=source.temporary.name)
-        path = Path(self.buffer_directory.name) / "buffer"
-        self.buffer_write = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        self.local_files = {}
+        self.buffer_directory = self.buffer_write = self.buffer_read = None
         try:
-            self.buffer_read = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
+            self.names = tuple(source.name(manifest.snapshot / shard.path) for shard in manifest.shards)
+            self.ids = {name: index for index, name in enumerate(self.names)}
+            self.shards = {name: shard.path for name, shard in zip(self.names, manifest.shards, strict=True)}
+            if source.local is not None:
+                for name in self.names:
+                    held = source.local.files[name]
+                    held.validate()
+                    descriptor = os.open(f"/proc/self/fd/{held.descriptor}",
+                                         os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
+                    self.local_files[name] = descriptor
+                    if file_identity(descriptor) != held.identity:
+                        raise RuntimeError("local checkpoint descriptor differs from its admitted inode")
+                    held.validate()
+            else:
+                self.buffer_directory = tempfile.TemporaryDirectory(prefix="read-", dir=source.temporary.name)
+                path = Path(self.buffer_directory.name) / "buffer"
+                self.buffer_write = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+                self.buffer_read = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
         except BaseException:
-            os.close(self.buffer_write)
-            self.buffer_directory.cleanup()
-            super()._close()
+            self._close()
             raise
 
     def manifest(self, path):
@@ -130,6 +148,39 @@ class RemoteWeightSession(DirectWeightSession):
                     break
                 if destinations_overlap(previous, following):
                     raise ValueError("overlapping checkpoint destinations require an explicit dependency")
+        if self.source.local is not None:
+            local_records = array("Q", records)
+            involved = set()
+            for index in range(0, len(records), 8):
+                if records[index + 4] != 2:
+                    values = records[index:index + 8]
+                    _, offset, width, pointer, transform, rows, source_stride, stride = values
+                    if (any(type(value) is not int or not 0 <= value < 1 << 63
+                            for value in (offset, width, pointer, rows, source_stride, stride))
+                            or (transform == 1 and width % 2)
+                            or offset + (rows - 1) * source_stride + width >= 1 << 63
+                            or pointer + (rows - 1) * stride + width * (1 + transform) >= 1 << 63):
+                        raise ValueError("invalid routed checkpoint geometry or expansion")
+                    name = self.names[records[index]]
+                    involved.add(name)
+                    local_records[index] = self.local_files[name]
+            for name in involved:
+                self.source.local.files[name].validate()
+            try:
+                # Preserve the complete native batch, including owned CPU scalar records.
+                super()._execute(local_records)
+            finally:
+                for name in involved:
+                    self.source.local.files[name].validate()
+            for index in range(0, len(records), 8):
+                if records[index + 4] != 2:
+                    name = self.names[records[index]]
+                    entry = self.source.files[name]
+                    key = ("payload_bytes" if entry["header_bytes"] is not None
+                           and records[index + 1] >= entry["header_bytes"] else "metadata_bytes")
+                    self.source.local_stats[key] += records[index + 2] * records[index + 5]
+                    self.source.local_stats["requests"] += 1
+            return
         for index in range(0, len(records), 8):
             identifier, offset, width, pointer, transform, rows, source_stride, destination_stride = records[index:index + 8]
             if transform == 2:
@@ -155,12 +206,22 @@ class RemoteWeightSession(DirectWeightSession):
     def stats(self, *, flush=True):
         result = super().stats(flush=flush)
         result["remote_source"] = dict(self.source.stats)
+        if self.source.local is not None:
+            result["local_source"] = dict(self.source.local_stats)
         return result
 
     def _close(self):
         try:
             super()._close()
         finally:
-            os.close(self.buffer_read)
-            os.close(self.buffer_write)
-            self.buffer_directory.cleanup()
+            for descriptor in self.local_files.values():
+                os.close(descriptor)
+            self.local_files.clear()
+            for name in ("buffer_read", "buffer_write"):
+                descriptor = getattr(self, name)
+                if descriptor is not None:
+                    setattr(self, name, None)
+                    os.close(descriptor)
+            if self.buffer_directory is not None:
+                self.buffer_directory.cleanup()
+                self.buffer_directory = None

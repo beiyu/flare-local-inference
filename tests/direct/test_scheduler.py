@@ -254,8 +254,9 @@ def test_admission_rejects_what_the_prepared_capacities_cannot_hold():
         scheduler.submit(request(2, [1] * 3000, limit=8))
     with pytest.raises(AdmissionError, match="vocabulary"):
         scheduler.submit(request(3, [VOCABULARY]))
-    with pytest.raises(AdmissionError, match="greedy"):
-        SamplingParameters(temperature=0.)
+    with pytest.raises(AdmissionError, match="temperature"):
+        SamplingParameters(temperature=-1.)
+    assert SamplingParameters(temperature=0.).temperature == 0.
 
 
 def test_requests_wait_for_slots_and_pages_and_rounds_alternate_with_prefill():

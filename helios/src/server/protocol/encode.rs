@@ -409,6 +409,9 @@ impl Encoder {
                 _ => {}
             }
             if let Event::ToolBegin { name, .. } = &event {
+                if self.tool_choice == ToolChoice::None {
+                    return Err("model emitted a tool call while tool_choice is none".into());
+                }
                 if let ToolChoice::Named(selected) = &self.tool_choice {
                     if name != selected {
                         return Err(format!("model emitted tool {name:?}, but tool_choice selects {selected:?}").into());

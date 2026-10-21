@@ -9,6 +9,7 @@ from ignition.components import sm103
 from ignition.components.kda_speculation import KDARecords, _record, register_recording
 from ignition.components.gated_norm import PreparedGatedRMSNorm
 from ignition.components.linear import QuantizedProjection
+from .projections import projection
 from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.recurrent import (
     DeltaMetadata,
@@ -101,11 +102,11 @@ class PreparedGlmKDA:
             ("g_b_proj", scratch.gate_input, scratch.z),
             ("o_proj", scratch.gated, scratch.output),
         ):
-            self.projections[key] = QuantizedProjection(input, weights[key], output,
-                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
+            self.projections[key] = projection(input, weights[key], output,
+                session=session, name=f"{name}.{key}", workspace=workspace)
         # The output-gate chain runs beside the input projections, or after them on the main stream.
         self.gate_overlap = None
-        if workspace.overlap:
+        if workspace.overlap and all(isinstance(p, QuantizedProjection) for p in self.projections.values()):
             self.gate_overlap = ConcurrentProjectionChain(
                 (self.projections["g_a_proj"], self.projections["g_b_proj"]),
                 parallel_plans=(self.projections["input_proj"].plan, self.projections["f_b_proj"].plan),

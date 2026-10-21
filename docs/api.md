@@ -41,7 +41,7 @@ The additional `flare` object reports prepared and selected serving metadata:
 | `default_max_tokens` | Default output-token budget when a request omits it; remaining context still bounds output |
 | `sampling_defaults` | Packaged seed, temperature, filters, and penalties used for omitted request fields |
 | `sampling_ranges` | Inclusive `{min, max}` bounds for distribution parameters; null fixes a parameter at its packaged default; seed remains request-controlled |
-| `max_images_per_prompt` | Context-derived upper bound on image count; image sizes, framing, text, output, and HTTP body size further constrain admission; zero for text-only packages |
+| `max_images_per_prompt` | Selected image count limit: the context-derived bound, optionally tightened by native `--max-images-per-prompt`; image sizes, framing, text, output, and HTTP body size further constrain admission; zero for text-only packages |
 | `max_image_tokens_per_prompt` | Context-derived upper bound on image tokens across the entire conversation; text, framing, and output also occupy context; zero for text-only packages |
 | `image_feature_window_tokens` | Prepared feature storage per active image request; chunked prefill reuses this storage across windows, so it does not limit total conversation image tokens |
 | `max_image_tokens_per_image` | Image tokens one image may cost after the profile's normalization; the smaller of one prepared vision graph and one feature window; zero for text-only packages |
@@ -51,7 +51,8 @@ The additional `flare` object reports prepared and selected serving metadata:
 | `output_modalities` | `text` |
 
 Generation requests always use the loaded model, regardless of the request's
-`model` string. Returned generation objects identify the loaded model.
+`model` string. Returned generation objects use discovery's first nonempty served
+alias, or the checkpoint identifier when no alias is configured.
 
 ## Generation log probabilities
 
@@ -122,7 +123,10 @@ serving key from `--api-key-file`, independently of client configuration.
 
 Request bodies support `identity`, `gzip`, zlib `deflate`, `br`, and `zstd` content
 encodings. Both encoded and decoded bodies are bounded by `max_body_bytes`
-(32 MiB by default). Decompression and frontend processing share the bounded
+(32 MiB by default, with an existing hard maximum of 256 MiB). Ignition caps its
+context/image-derived estimate at that native maximum; an image-count allowance
+does not guarantee that all images fit together in one HTTP body. Decompression
+and frontend processing share the bounded
 frontend worker pool. Invalid requests receive protocol-specific JSON errors;
 failures after streaming begins produce protocol-specific terminal error events.
 
@@ -240,6 +244,17 @@ selects required mode. Named selection uses
 `{"type":"function","name":"lookup"}` in Responses. Responses custom tools use
 `{"type":"custom","name":"lookup"}`; namespaced tools use `namespace__name`.
 The selected tool must be declared and its type must match.
+
+With `tool_choice: "none"` and declared tools, the rendered prompt retains the
+automatic tool context. Native sampling masks its prepared tool-opening added
+token at every position, including speculative verification. The opener must be
+one exact added token with matching content and encode/decode bytes; both
+`special: true` and `special: false` are supported. Ordinary base-vocabulary words
+and composite openers do not satisfy this requirement and return HTTP 400 for
+this combination. No-tools requests need no mask. These static exclusions
+can coexist with string/token stops and intersect structured-output masks.
+If alternative ordinary tokens nevertheless spell a parseable call, generation
+fails before publishing any tool event.
 
 Named selection presents only the selected tool definition to the model, retaining
 conversation history and adding no instructions or decoding constraints.
@@ -368,8 +383,12 @@ Prepared model defaults fill omitted sampling fields. Numeric request values for
 and `frequency_penalty` are clamped to the inclusive ranges declared in the
 package. A parameter without a range is fixed at its packaged default, including
 in packages exported without range metadata. Ranges must contain their defaults
-and valid sampler values; temperature bounds are positive. For example,
-`temperature: 0` becomes the declared minimum, or the default if no range exists.
+and valid sampler values. A temperature range whose minimum is zero admits exact
+argmax decoding: zero temperature ignores top-k, top-p and min-p, retains penalties
+and grammar masks, and selects the lowest token ID when maxima tie. Positive
+subnormal temperatures are rejected rather than rounded to zero. Packages with
+positive temperature bounds, including previously exported packages, continue
+clamping zero to their minimum, or to the default if no range exists.
 Malformed types still return HTTP 400; `top_k` must be an integer. `seed` remains
 request-controlled and uses its packaged default when omitted. Sampling defaults
 and ranges come from the model author's recommendations declared in the recipe.
@@ -384,7 +403,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | --- | --- | --- | --- | --- | --- |
 | `qwen38` | 1 | 0.95 | 20 | Temperature [0.7, 1]; top-p [0.8, 0.95]; presence penalty [0, 2] | [Qwen3.8-Flash-Next thinking/instruct presets](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices) |
 | `qwen38_dense` | 1 | 0.95 | 20 | Temperature [0.7, 1]; top-p [0.8, 0.95]; presence penalty [0, 2] | [Qwen3.8-27B thinking/instruct presets](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices) |
-| `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
+| `glm53` | 1 | 0.95 | Disabled | Temperature [0, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes); zero temperature preserves the migration client contract |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
 | `deepseek41` | 1 | 1 | Disabled | None | [DeepSeek-V4.1-Flash-1017 inference recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
 | `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
@@ -435,10 +454,11 @@ stops during initial token-delimited XTML reasoning returns HTTP 400: literal
 marker text and actual control tokens have different semantics, so a decoded-string
 guard is unsupported.
 
-Omitting `stop_scope`, setting it to null, or selecting `"all"` retains the
-default behavior for every model package. Other values are rejected. The option
-is accepted by all four inference APIs; callers must set it on each request,
-because there is no server-wide default. It changes only string-stop matching:
+Omitting `stop_scope` or setting it to null uses the listener's
+`--default-stop-scope`; its default `all` preserves existing package behavior.
+Explicit `"all"` or `"after_reasoning"` overrides that default for the request.
+Other values are rejected. All four inference APIs accept the option. It changes
+only string-stop matching:
 EOS, output limits, cancellation, token-stop rules, and the incompatibility of
 string stops with token stops or structured output remain unchanged.
 

@@ -26,6 +26,8 @@ fn single_host_run_reaches_package_loading() {
             "qwen3.8-flash",
         ],
         vec!["--gpus", "0,1"],
+        vec!["--served-model-name", "GLM-5.3-Flash",
+            "--served-model-name", "spark/GLM-5.3-Flash"],
     ] {
         let mut arguments = vec!["run", package.to_str().unwrap()];
         arguments.extend(options);

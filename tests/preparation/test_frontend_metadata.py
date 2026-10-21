@@ -23,14 +23,14 @@ def test_default_mode_uses_manually_declared_model_card_sampling(recipe):
         expected["ranges"] = {"temperature": {"min": .7, "max": 1.}, "top_p": {"min": .8, "max": .95},
                               "presence_penalty": {"min": 0., "max": 2.}}
     elif recipe.name == "glm53":
-        expected["ranges"] = {"temperature": {"min": .95, "max": 1.}, "top_p": {"min": .95, "max": 1.}}
+        expected["ranges"] = {"temperature": {"min": 0., "max": 1.}, "top_p": {"min": .95, "max": 1.}}
     elif recipe.name == "kimi3":
         expected["ranges"] = {"top_p": {"min": .95, "max": 1.}}
     assert recipe.sampling_defaults.as_dict() == expected
 
 
-@pytest.mark.parametrize("temperature", [0., -0., -1., float("nan"), float("inf")])
-def test_recipe_defaults_require_positive_finite_temperature(temperature):
+@pytest.mark.parametrize("temperature", [-1., 1e-100, float("nan"), float("inf")])
+def test_recipe_defaults_require_nonnegative_finite_temperature(temperature):
     with pytest.raises(ValueError, match="invalid recipe sampling defaults"):
         SamplingDefaults(temperature=temperature, top_p=.95, top_k=20)
 
@@ -93,7 +93,7 @@ def server():
         assets={"tokenizer": {}, "chat_template": {}})
 
 
-@pytest.mark.parametrize("ranges", [{}, {
+@pytest.mark.parametrize("ranges", [{}, {"temperature": {"min": 0., "max": 1.}}, {
     "temperature": {"min": .5, "max": 1.5}, "top_k": {"min": -1, "max": 100},
     "presence_penalty": {"min": 0., "max": 0.},
 }])
@@ -136,7 +136,7 @@ def test_recipe_sampling_ranges_are_optional_and_preserve_defaults():
 
 
 @pytest.mark.parametrize("name,bounds", [
-    ("seed", (0, 1)), ("unknown", (0, 1)), ("temperature", (0., 1.)),
+    ("seed", (0, 1)), ("unknown", (0, 1)), ("temperature", (-1., 1.)),
     ("temperature", (1.5, 2.)), ("temperature", (2., 1.)),
     ("temperature", (float("nan"), 2.)), ("temperature", (.5, float("inf"))),
     ("temperature", (1e-100, 2.)), ("temperature", (.5, 1e100)),

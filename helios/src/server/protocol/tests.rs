@@ -82,6 +82,45 @@ fn protocols_decode_to_equivalent_conversations() {
 }
 
 #[test]
+fn tool_choice_none_rejects_literal_calls_before_emitting_any_tool_frame() {
+    use crate::{
+        model::contract::{ToolParser, ToolParserKind},
+        output::{Input as OutputInput, OutputConfig, OutputPipeline, tagged},
+    };
+    let mut syntax = crate::model::testing::metadata().frontend;
+    syntax.tools = Some(ToolParser {
+        kind: ToolParserKind::GlmArgumentTags,
+        wrapping_newlines: 0,
+        tag_separator: String::new(),
+    });
+    let mut parser = OutputPipeline::new(OutputConfig {
+        syntax,
+        control_tokens: vec![],
+        content: tagged::OutputConfig {
+            structured: false,
+            start: tagged::OutputStart::Content,
+            tools: vec![json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}})],
+        },
+    });
+    // Ordinary token bytes can spell a marker even when its special token is
+    // excluded. The protocol must never publish a disabled call in that case.
+    let events = parser.push(OutputInput::Text("<tool_call>lookup<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>")).unwrap();
+    assert!(events.iter().any(|event| matches!(event, Event::ToolBegin { .. })));
+    for protocol in [Protocol::Chat, Protocol::Messages, Protocol::Responses] {
+        let mut encoder = encoder_with_choice(protocol, ToolChoice::None);
+        let error = encoder.apply(0, events.clone()).err().unwrap();
+        assert!(error.to_string().contains("tool_choice is none"));
+        let response = encoder.response();
+        match protocol {
+            Protocol::Chat => assert!(response["choices"][0]["message"]["tool_calls"].is_null()),
+            Protocol::Messages => assert!(response["content"].as_array().unwrap().iter().all(|part| part["type"] != "tool_use")),
+            Protocol::Responses => assert!(response["output"].as_array().unwrap().iter().all(|part| part["type"] != "function_call" && part["type"] != "custom_tool_call")),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn required_tool_choice_is_shared_and_requires_declared_tools() {
     let mut requests = vec![];
     for (protocol, mut body) in [

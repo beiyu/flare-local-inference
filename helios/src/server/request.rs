@@ -7,6 +7,18 @@ use crate::{
 use base64::Engine;
 use serde_json::{Map, Value};
 
+fn tool_opening_token(tokenizer: &tokenizers::Tokenizer, marker: &str) -> Option<u32> {
+    let id = tokenizer.token_to_id(marker)?;
+    let added = tokenizer.get_added_tokens_decoder();
+    if added.get(&id)?.content != marker
+        || tokenizer.encode(marker, false).ok()?.get_ids() != [id]
+        || tokenizer.decode(&[id], false).ok()? != marker
+    {
+        return None;
+    }
+    Some(id)
+}
+
 pub struct PreparedRequest {
     pub prompt: Prompt,
     pub stream: bool,
@@ -151,6 +163,7 @@ pub(super) fn prepare_inference_cached(
     }
     let tool_choice = match request.tool_choice {
         ToolChoice::Auto => None,
+        ToolChoice::None if !request.tools.is_empty() => Some("auto"),
         ToolChoice::None => Some("none"),
         ToolChoice::Required => Some("required"),
         ToolChoice::Named(_) => Some("auto"),
@@ -173,9 +186,7 @@ pub(super) fn prepare_inference_cached(
         }
     }
 
-    if request.tool_choice == ToolChoice::None {
-        options.insert("tools".into(), Value::Array(vec![]));
-    } else if !request.tools.is_empty() {
+    if !request.tools.is_empty() {
         options.insert("tools".into(), Value::Array(request.tools.iter().filter(|tool| {
             match &request.tool_choice {
                 ToolChoice::Named(name) => tool.native_name() == *name,
@@ -238,9 +249,27 @@ pub(super) fn prepare_inference_cached(
             structured,
         )?)
     };
-    let envelope = output
+    let mut envelope = output
         .as_ref()
         .and_then(crate::output::OutputPipeline::grammar_envelope);
+    let forbidden_tool = if request.tool_choice == ToolChoice::None && !request.tools.is_empty() {
+        let marker = envelope
+            .as_ref()
+            .and_then(|envelope| envelope.tool)
+            .map(|(open, _)| open)
+            .ok_or("tool_choice none with tools requires a prepared tool opener")?;
+        let tokenizer = frontend.tokenizer();
+        let token = tool_opening_token(tokenizer, marker)
+            .ok_or("tool_choice none requires a single dedicated tool-opening added token")?;
+        if let Some(envelope) = &mut envelope {
+            envelope.tool = None;
+            envelope.function = None;
+            envelope.tool_body_start = false;
+        }
+        Some(token)
+    } else {
+        None
+    };
     let grammar = match &opts.constraint {
         Some(Constraint::JsonObject) => Some(
             compiler
@@ -253,6 +282,10 @@ pub(super) fn prepare_inference_cached(
             Some(compiler.compile_lark_in(source, envelope.as_ref())?)
         }
         None => None,
+    };
+    let grammar = match forbidden_tool {
+        Some(token) => Some(compiler.exclude_tokens(grammar, &[token])?),
+        None => grammar,
     };
     let mut message_boundaries = if raw.is_some() {
         Vec::new()
@@ -278,11 +311,11 @@ pub(super) fn prepare_inference_cached(
     let stop_sequences = opts.token_stops.clone();
     super::stops::TokenStops::new(stop_sequences.clone(), config.contract.vocabulary)?;
     let stop_strings = opts.stops.clone();
-    super::stops::validate_strings(&stop_strings, !stop_sequences.is_empty(), grammar.is_some())?;
-    if grammar.is_some() && !stop_sequences.is_empty() {
+    super::stops::validate_strings(&stop_strings, !stop_sequences.is_empty(), structured)?;
+    if structured && !stop_sequences.is_empty() {
         return Err("structured output cannot be combined with custom token stops".into());
     }
-    if grammar.is_some()
+    if structured
         && requests_continuation(
             options
                 .get("continue_final_message")
@@ -328,7 +361,7 @@ pub(super) fn prepare_inference_cached(
     };
     super::stops::validate_initial_reasoning(string_stop_reasoning.as_ref())?;
     let ignore_eos = opts.ignore_eos;
-    if ignore_eos && grammar.is_some() {
+    if ignore_eos && structured {
         return Err("structured output cannot ignore end-of-sequence tokens".into());
     }
     Ok(PreparedInference {
@@ -408,7 +441,7 @@ pub(super) fn sampling_parameters(
     let top_k = ranges
         .top_k
         .unwrap_or_else(|| SamplingRange::fixed(defaults.top_k));
-    let sampling = SamplingParameters {
+    let mut sampling = SamplingParameters {
         seed: integer(object, "seed", defaults.seed)?,
         temperature: sampling_number(
             object,
@@ -450,6 +483,11 @@ pub(super) fn sampling_parameters(
             .transpose()?
             .unwrap_or(defaults.top_k),
     };
+    if sampling.temperature == 0. {
+        sampling.top_k = 1;
+        sampling.top_p = 1.;
+        sampling.min_p = 0.;
+    }
     sampling.validate()?;
     Ok(sampling)
 }
@@ -468,6 +506,8 @@ fn sampling_number(
             value
                 .as_f64()
                 .filter(|v| v.is_finite())
+                .filter(|v| !(name == "temperature" && range.min == 0.
+                    && *v > 0. && *v < f64::from(f32::MIN_POSITIVE)))
                 .map(|v| v.clamp(f64::from(range.min), f64::from(range.max)) as f32)
                 .ok_or_else(|| {
                     Error::admission(
@@ -496,6 +536,28 @@ fn integer(object: &Map<String, Value>, name: &str, default: u64) -> Result<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_opener_requires_one_exact_added_token_independent_of_special_flag() {
+        use tokenizers::{AddedToken, Tokenizer};
+        let model = || tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(
+                [("a".to_owned(), 0), ("<tool_call>".to_owned(), 1)]
+                    .into_iter().collect::<tokenizers::models::bpe::Vocab>(),
+                vec![],
+            ).build().unwrap();
+        let plain = Tokenizer::new(model());
+        assert!(tool_opening_token(&plain, "a").is_none(), "ordinary vocabulary words cannot be masked");
+        assert!(tool_opening_token(&plain, "<tool_call>").is_none(), "base vocabulary alone does not declare a control token");
+        for special in [false, true] {
+            let mut tokenizer = Tokenizer::new(model());
+            tokenizer.add_tokens([AddedToken::from("<tool_call>", special).normalized(false)]).unwrap();
+            assert_eq!(tool_opening_token(&tokenizer, "<tool_call>"), Some(1));
+            assert!(tool_opening_token(&tokenizer, "\n<tool_call>").is_none());
+            assert!(tool_opening_token(&tokenizer, "<missing>").is_none());
+            assert!(tool_opening_token(&tokenizer, "a").is_none());
+        }
+    }
 
     fn png_data_url(width: u32, height: u32) -> String {
         let mut info = png::Info::with_size(width, height);
@@ -771,6 +833,29 @@ mod tests {
             assert_eq!(result.top_k, expected_k);
             assert_eq!(result.seed, u64::MAX);
         }
+    }
+
+    #[test]
+    fn zero_temperature_is_greedy_only_when_the_package_range_includes_it() {
+        let defaults = SamplingParameters::default();
+        let ranges = SamplingRanges {
+            temperature: Some(SamplingRange { min: 0., max: 1. }),
+            ..Default::default()
+        };
+        for temperature in [0., -0.] {
+            let object = serde_json::json!({"temperature":temperature, "seed":77,
+                "top_p":0.01, "min_p":1., "top_k":50});
+            let sampling = sampling_parameters(object.as_object().unwrap(), &defaults, &ranges).unwrap();
+            assert_eq!(sampling.temperature, 0.);
+            assert_eq!((sampling.top_k, sampling.top_p, sampling.min_p), (1, 1., 0.));
+            assert_eq!(sampling.seed, 77);
+            let legacy = sampling_parameters(object.as_object().unwrap(), &defaults,
+                &SamplingRanges::default()).unwrap();
+            assert_eq!(legacy.temperature, defaults.temperature);
+            assert_eq!(legacy.top_k, defaults.top_k);
+        }
+        let tiny = serde_json::json!({"temperature":1e-100});
+        assert!(sampling_parameters(tiny.as_object().unwrap(), &defaults, &ranges).is_err());
     }
 
     #[test]

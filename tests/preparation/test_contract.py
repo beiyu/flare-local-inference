@@ -125,3 +125,37 @@ def test_dense_qwen_preserves_device_decode_and_page_storage_in_typed_contract()
         assert buffers[region.storage.buffer] is tensor
         assert region.storage.buffer == f"cache.{name}"
         assert region.storage.stride == region.storage.nbytes == 128 * 4 * 256 * 2
+
+
+def test_glm_vision_graph_and_prefill_use_existing_typed_feature_bindings():
+    from ignition.recipes.glm53.contract import prepare
+    pool = SimpleNamespace(layout=SimpleNamespace(row_bytes=32, region=lambda _: SimpleNamespace(offset=0, nbytes=8)))
+    fields = ("vision_pixel_values", "vision_position_ids", "vision_cu_seqlens", "vision_num_patches",
+        "vision_num_features", "vision_slot", "vision_generation", "vision_feature_offset", "vision_feature_slot")
+    signatures = {"vision8192": GraphSignature("vision", 1, 8192, fields),
+        "prefill4096": GraphSignature("prefill", 1, 4096, ("token_ids", "vision_token_indices", "vision_feature_slot"))}
+    value = ParseDict(prepare(signatures, {}, pool, page_tokens=256, draft_lag=None, image_slots=1), p.ModelContract())
+    assert value.vision.feature_slots == 1 and value.vision.features_per_request == 2048
+    assert value.vision.patches_per_feature == 4 and list(value.vision.patch_capacities) == [64, 256, 1024, 4096, 8192]
+    assert value.frontend.image_preparation == p.GLM_IMAGE_PREPARATION
+    assert value.frontend.image_layout == p.GLM_IMAGE_LAYOUT
+    vision, prefill = value.graphs
+    assert vision.kind == p.VISION and not vision.state
+    assert {binding.buffer: binding.source for binding in vision.inputs} == {
+        name: p.REQUEST_SLOT if name == "vision_slot" else p.REQUEST_GENERATION if name == "vision_generation"
+        else p.IMAGE_FEATURE_SLOT if name == "vision_feature_slot" else p.IMAGE_TENSOR for name in fields}
+    assert {binding.buffer: binding.source for binding in prefill.inputs} == {
+        "token_ids": p.PROMPT_TOKEN, "vision_token_indices": p.IMAGE_FEATURE_INDEX,
+        "vision_feature_slot": p.IMAGE_FEATURE_SLOT}
+    assert value.frontend.image_tokens.span.max_tokens == 2050
+
+
+def test_glm_text_only_catalog_keeps_absent_image_contract_semantics():
+    from ignition.recipes.glm53.contract import prepare
+    pool = SimpleNamespace(layout=SimpleNamespace(row_bytes=32, region=lambda _: SimpleNamespace(offset=0, nbytes=8)))
+    value = ParseDict(prepare({}, {}, pool, page_tokens=256, draft_lag=None, image_slots=0), p.ModelContract())
+    assert value.vision.feature_slots == 0 and value.vision.features_per_request == 0
+    assert value.frontend.image_preparation == p.IMAGE_PREPARATION_UNSPECIFIED
+    assert value.frontend.image_layout == p.IMAGE_LAYOUT_UNSPECIFIED
+    assert not value.frontend.HasField("image_tokens")
+    assert list(value.frontend.rejected_tokens) == [*range(154830, 154836), 154854, 154855]

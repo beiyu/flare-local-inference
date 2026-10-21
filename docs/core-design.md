@@ -1196,14 +1196,16 @@ Replicated floating-point arithmetic need not be bit-identical across ranks.
 
 Temperature, top-k, top-p, min-p and penalty controls use one captured
 probability-sampling path built from FlashInfer primitives. Captured operations
-manage penalties, grammar masks and request-state updates. Temperature must be
-positive; zero-temperature requests are rejected because greedy decoding
-collapses the model's probability distribution.
+manage penalties, grammar masks and request-state updates. Positive temperatures
+retain stochastic filtering. A prepared temperature range that includes zero
+admits exact argmax after penalties and grammar masking, with lowest-token-ID
+tie breaking. Such requests ignore probability cutoff filters. Existing packages
+with positive temperature bounds retain their original clamping behavior.
 
 Execution ABIs 2 and 3 retain `sampling_mode="general"` as their sole
 supported manifest value. Bounded top-k optimization is deferred. Measure
-sampler cost inside the complete graph before changing it; threshold ties
-must never be truncated to a fixed number of candidates.
+sampler cost inside the complete graph before changing it; stochastic threshold
+ties must never be truncated to a fixed number of candidates.
 
 Repetition, presence, and frequency penalties read a per-slot vocabulary
 histogram. A captured operation builds it from the full prompt token buffer at

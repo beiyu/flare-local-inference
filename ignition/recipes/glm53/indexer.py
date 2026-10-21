@@ -10,7 +10,8 @@ from b12x.preparation import PreparedCall
 from ignition.components import sm103
 from ignition.components.indexer import PreparedSparseIndexer
 from ignition.components.indexer_sm103 import Sm103SparseIndexer
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.linear import UnquantizedProjection
+from .projections import projection
 from ignition.preparation.tuning import declare
 
 
@@ -144,10 +145,12 @@ class PreparedGlmIndexer:
         module.k_norm.weight = torch.nn.Parameter(weights["indexer.k_norm.weight"], requires_grad=False)
         module.k_norm.bias = torch.nn.Parameter(weights["indexer.k_norm.bias"], requires_grad=False)
         self.ape = weights["indexer.index_kpool_compress_ape"]
-        self.query_projection = QuantizedProjection(query_residual, weights["indexer.wq_b"], scratch.query,
-            session=session, name=f"{name}.query", workspace=workspace, activation_mode="auto")
+        self.query_projection = projection(query_residual, weights["indexer.wq_b"], scratch.query,
+            session=session, name=f"{name}.query", workspace=workspace)
         self.gate_projection = UnquantizedProjection(source, weights["indexer.index_kpool_compress_gate"], scratch.gate,
             session=session, name=f"{name}.gate")
+        self.head_projection = (UnquantizedProjection(source, weights["indexer.weights_proj"], scratch.weights,
+            session=session, name=f"{name}.head_weights") if "indexer.weights_proj" in weights else None)
         self.query_arguments = (scratch.query.view(-1, 128), scratch.query_fp8.view(-1, 128),
                                 scratch.query_scales.view(-1), scratch.weights.view(-1))
         self.query_plan = glm_pool.plan_queries(*self.query_arguments)
@@ -176,6 +179,7 @@ class PreparedGlmIndexer:
             scores=None if context is None else scratch.scores[start:end])
             for start in range(0, rows, step) for end in (min(start + step, rows),))
         self.scratch_plans = (self.query_projection.plan,
+            *((self.head_projection.plan,) if self.head_projection is not None else ()),
             *(selector.plan for selector in self.selectors if isinstance(selector, PreparedSparseIndexer)))
         self.gathers = ()
         if context is not None:
@@ -214,7 +218,10 @@ class PreparedGlmIndexer:
         self.query_projection(self.query_residual)
         s.normalized_key.copy_(self.module.k_norm(self.key_input))
         self.gate_projection(self.source)
-        s.weights.copy_(self.weight_input)
+        if self.head_projection is None:
+            s.weights.copy_(self.weight_input)
+        else:
+            self.head_projection(self.source)
         glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
         glm_pool.update_pools(*self.pool_arguments, plan=self.pool_plan)
         if self.prepares_tables:

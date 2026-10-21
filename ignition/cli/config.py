@@ -16,7 +16,7 @@ DEFAULT_PATH = Path("~/.config/flare/config.toml")
 
 _SECTIONS = {
     "publishing": {"signing_key": str, "namespace": str, "official_source": str, "shard_size": str},
-    "server": {"host": str, "port": int, "api_key": str},
+    "server": {"host": str, "port": int, "api_key": str, "default_stop_scope": str, "default_max_new_tokens": int},
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int, "speculative_token_capacity": int},
     "memory": {"reserve": str},
     "preparation": {"compile_workers": int, "checkpoint_token_file": str},
@@ -29,6 +29,7 @@ _MODEL_KEYS = {"max_concurrency": int, "image_concurrency": int, "speculative_to
 _BUILT_IN = {
     "publishing.shard_size": "64G",
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
+    "server.default_stop_scope": "all", "server.default_max_new_tokens": None,
     "memory.reserve": "0",
     "preparation.compile_workers": 0,
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
@@ -109,6 +110,8 @@ class Configuration:
         transport = configuration.get("prefix_cache.disk_transport").value
         if transport and transport not in _TRANSPORTS:
             raise UsageError(f"{resolved}: disk_transport in [prefix_cache] must be one of {', '.join(_TRANSPORTS)}")
+        if configuration.get("server.default_stop_scope").value not in ("all", "after_reasoning"):
+            raise UsageError(f"{resolved}: default_stop_scope must be all or after_reasoning")
         return configuration
 
     @staticmethod
@@ -120,6 +123,8 @@ class Configuration:
                 raise UsageError(f"{path}: unknown key {key} in [{section}]")
             if type(value) is not schema[key]:
                 raise UsageError(f"{path}: {key} in [{section}] must be {schema[key].__name__}")
+            if key == "default_max_new_tokens" and not 1 <= value <= 2**31 - 1:
+                raise UsageError(f"{path}: default_max_new_tokens must be 1 through 2147483647")
             if key == "port" and not 1 <= value <= 65535:
                 raise UsageError(f"{path}: port in [{section}] must be 1 through 65535")
             if key in ("max_concurrency", "image_concurrency", "speculative_token_capacity", "compile_workers") and value < 1:
@@ -188,6 +193,8 @@ class Configuration:
             f'# host = "{self.get("server.host").value}"',
             f'# port = {self.get("server.port").value}',
             '# api_key = ""                    # empty: no authentication',
+            '# default_stop_scope = "all"       # all or after_reasoning; explicit requests win',
+            '# default_max_new_tokens = 65536   # omitted: package default; explicit requests win',
             "", "[defaults]",
             f'# model = "{model}"',
             f"# max_concurrency = {max_concurrency}",

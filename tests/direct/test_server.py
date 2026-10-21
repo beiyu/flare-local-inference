@@ -33,6 +33,17 @@ def test_request_sampling_clamps_to_inclusive_model_ranges():
     assert _sampling({"temperature": .75, "top_k": 5}, defaults).top_k == 5
 
 
+def test_zero_temperature_uses_greedy_only_with_an_explicit_zero_bound():
+    defaults = {**DEFAULTS, "ranges": {"temperature": dict(min=0., max=1.)}}
+    for value in [0., -0.]:
+        sampling = _sampling({"temperature": value, "seed":99, "top_k":500}, defaults)
+        assert (sampling.temperature, sampling.top_k, sampling.top_p, sampling.min_p) == (0., 1, 1., 0.)
+        assert sampling.seed == 99
+        assert _sampling({"temperature":value}, DEFAULTS).temperature == 1.
+    with pytest.raises(AdmissionError, match="temperature"):
+        _sampling({"temperature":1e-100}, defaults)
+
+
 class Tokenizer:
     def decode(self, tokens, skip_special_tokens):
         assert not skip_special_tokens

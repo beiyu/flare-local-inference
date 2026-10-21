@@ -93,6 +93,39 @@ def test_multi_host_ranks_parse_for_rank_zero_and_its_peers():
     assert (rank_zero.model, rank_zero.ranks, rank_zero.rendezvous) == ("glm-5.3-flash", 4, "10.0.0.1:29600")
     peer = _parser().parse_args(["join", "10.0.0.1:29600", "--rank", "3", "--ranks", "4"])
     assert (peer.rendezvous, peer.rank, peer.ranks, peer.gpu) == ("10.0.0.1:29600", 3, 4, 0)
+    assert peer.local_checkpoint is None
+    local = _parser().parse_args(["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "2",
+                                 "--local-checkpoint", "/models/verified-copy"])
+    assert local.local_checkpoint == Path("/models/verified-copy")
+
+
+def test_join_passes_the_explicit_local_checkpoint_to_its_peer(host, tmp_path, monkeypatch):
+    from ignition.cli import serve
+    from ignition.preparation import host_ranks
+
+    checkpoint = tmp_path / "local-checkpoint"
+    checkpoint.mkdir()
+    seen = []
+    monkeypatch.setattr(serve.environment, "apply", lambda *args: None)
+    monkeypatch.setattr(host_ranks, "source_identity", lambda: "same-code")
+    monkeypatch.setattr(host_ranks, "local_topology", lambda gpu: {})
+    monkeypatch.setattr(host_ranks, "knock", lambda *args, **kwargs: (object(), object()))
+    monkeypatch.setattr(host_ranks, "serve_peer", lambda *args, **kwargs: seen.append(kwargs))
+    assert main(["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "2",
+                 "--local-checkpoint", str(checkpoint)]) == 0
+    assert seen[0]["local_checkpoint"] == checkpoint.resolve()
+
+
+def test_join_rejects_a_missing_local_checkpoint_before_connecting(host, tmp_path, monkeypatch, capsys):
+    from ignition.preparation import host_ranks
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("missing local checkpoint must be rejected before connecting")
+
+    monkeypatch.setattr(host_ranks, "knock", unexpected)
+    assert main(["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "2",
+                 "--local-checkpoint", str(tmp_path / "absent")]) == 2
+    assert "local checkpoint directory does not exist" in failure(capsys)[0]
 
 
 @pytest.mark.parametrize("limit", ["30g", "-30g", "0.8", "1", "1.5GiB", "0.001K"])
@@ -292,3 +325,26 @@ def test_roce_ring_requires_multiple_hosts_before_model_or_gpu_work(tmp_path, ca
     args = _parser().parse_args(["export", "qwen3.8-flash", "--output", str(tmp_path / "model"),
                                "--roce-ring", "--ranks", "4"])
     assert args.roce_ring
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "2147483648", "1.5"])
+def test_invalid_default_output_limit_fails_before_preparation(value):
+    for command in ("run", "serve"):
+        with pytest.raises(SystemExit) as error:
+            _parser().parse_args([command, "glm-5.3-flash", "--default-max-new-tokens", value])
+        assert error.value.code == 2
+
+
+def test_runtime_defaults_and_explicit_exl3_library_parse_in_their_own_commands():
+    for command in ("run", "export", "serve"):
+        args = _parser().parse_args([command, "glm-5.3-flash", "--exl3-library", "/preparation/cooperative.so"])
+        assert args.exl3_library == Path("/preparation/cooperative.so")
+        prefill = _parser().parse_args([command, "glm-5.3-flash", "--exl3-prefill-library", "/preparation/exllamav3_ext.so"])
+        assert prefill.exl3_prefill_library == Path("/preparation/exllamav3_ext.so")
+        vision = _parser().parse_args([command, "glm-5.3-flash", "--glm-vision-kernels", "/preparation/vision"])
+        assert vision.glm_vision_kernels == Path("/preparation/vision")
+    for command in ("run", "serve"):
+        args = _parser().parse_args([command, "glm-5.3-flash", "--default-max-new-tokens", "65536", "--default-stop-scope", "after_reasoning"])
+        assert args.default_max_new_tokens == 65536 and args.default_stop_scope == "after_reasoning"
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["export", "glm-5.3-flash", "--default-stop-scope", "after_reasoning"])

@@ -189,8 +189,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = owner.server_config().clone();
     config["bind"] = bind.to_string().into();
     config["scheduler_policy"] = args.scheduler_policy.into();
-    if let Some(name) = args.served_model_name {
-        config["served_names"] = serde_json::json!([name]);
+    config["default_stop_scope"] = args.default_stop_scope.into();
+    if let Some(limit) = args.default_max_new_tokens {
+        config["max_new_tokens"] = limit.into();
+    }
+    if let Some(limit) = args.max_images_per_prompt {
+        config["max_images_per_prompt"] = limit.into();
+    }
+    if !args.served_model_name.is_empty() {
+        config["served_names"] = serde_json::json!(args.served_model_name);
     }
     config["api_key"] = key.unwrap_or_default().into();
     phase.finish(config["model_id"].as_str().unwrap_or_default());

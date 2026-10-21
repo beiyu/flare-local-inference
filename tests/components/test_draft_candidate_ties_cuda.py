@@ -16,14 +16,14 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @contextmanager
-def _captured_proposal(scores, top_k):
+def _captured_proposal(scores, top_k, temperature=1.):
     device = scores.device
     vocab = scores.shape[1]
     probabilities = torch.zeros_like(scores)
     valid = torch.ones(1, dtype=torch.bool, device=device)
     packed_k = torch.tensor([top_k or vocab], dtype=torch.int32, device=device)
     packed_p = torch.tensor([.95], device=device)
-    parameters = torch.tensor([[1., .95, 0., 1., 0., 0.]], device=device)
+    parameters = torch.tensor([[temperature, .95, 0., 1., 0., 0.]], device=device)
     slots = torch.zeros(1, dtype=torch.int32, device=device)
     seed = torch.tensor([17], dtype=torch.int64, device=device)
     offset = torch.zeros(1, dtype=torch.int64, device=device)
@@ -92,3 +92,20 @@ def test_signed_zero_scores_preserve_boundary_ties_and_draw_order(vocab, top_k):
         assert torch.equal(probabilities, expected_probabilities)
         assert torch.equal(sampled, expected_sampled)
         assert valid.all()
+
+
+@pytest.mark.parametrize("top_k", [0, 1, 64])
+@torch.no_grad()
+def test_zero_temperature_draft_proposals_choose_lowest_id_across_blocks(top_k):
+    scores = torch.full((1, 8192), -torch.inf, device="cuda")
+    scores[0, [4095, 4096, 8191]] = 2.
+    with _captured_proposal(scores, top_k, temperature=0.) as (probabilities, valid, sampled, replay):
+        replay()
+        assert valid.all()
+        assert sampled.item() == 4095
+        assert probabilities.count_nonzero().item() == 1
+        assert probabilities[0, 4095].item() == 1.
+        scores[:, 17] = 3.
+        replay()
+        assert sampled.item() == 17
+        assert probabilities.count_nonzero().item() == 1

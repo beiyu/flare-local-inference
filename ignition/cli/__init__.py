@@ -70,9 +70,22 @@ def _parser() -> argparse.ArgumentParser:
     running.add_argument("--memory-limit", type=memory_limit, metavar="LIMIT",
                          help="per-GPU serving memory: occupied size (30G), free reserve (-30G), or total fraction (0.8)")
     serving = command("serve", serve.serve, "prepare in this process and serve over HTTP, with peer ranks on other hosts")
+    def output_limit(value):
+        try:
+            limit = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("output limit must be an integer") from error
+        if not 1 <= limit <= 2**31 - 1:
+            raise argparse.ArgumentTypeError("output limit must be 1 through 2147483647")
+        return limit
+
     for listening in (running, serving):
         listening.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
         listening.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
+        listening.add_argument("--default-max-new-tokens", type=output_limit, metavar="N",
+                               help="output limit for omitted request values (default: server.default_max_new_tokens, else package)")
+        listening.add_argument("--default-stop-scope", choices=("all", "after_reasoning"), metavar="SCOPE",
+                               help="string-stop scope for omitted request values (default: server.default_stop_scope, else all)")
     _preparation_arguments(serving)
     for spanning in (serving, exporting):
         hosts = spanning.add_argument_group("multi-host tensor parallelism")
@@ -102,6 +115,8 @@ def _parser() -> argparse.ArgumentParser:
     joining.add_argument("--rank", type=int, required=True, metavar="R", help="this host's rank, 1 through N-1")
     joining.add_argument("--ranks", type=int, required=True, choices=range(2, 17), metavar="N", help="tensor-parallel ranks")
     joining.add_argument("--gpu", type=int, default=0, metavar="INDEX", help="this host's GPU (default: 0)")
+    joining.add_argument("--local-checkpoint", type=Path, metavar="DIR",
+                         help="load this local checkpoint after authenticated whole-file verification against rank zero")
     keys = command("keygen", publishing.keygen, "create an encrypted production signing key and public profile")
     keys.add_argument("--directory", required=True, type=Path, help="new private directory; must not exist")
     keys.add_argument("--name", required=True, help="publisher display name")
@@ -135,6 +150,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _preparation_arguments(running):
+    running.add_argument("--exl3-library", type=Path, metavar="PATH",
+                         help="advanced: explicit EXL3 preparation CUDA library; exported native serving does not load it")
+    running.add_argument("--exl3-prefill-library", type=Path, metavar="PATH",
+                         help="advanced: original EXL3 prefill extension binary used only to extract preparation cubins")
+    running.add_argument("--glm-vision-kernels", type=Path, metavar="DIR",
+                         help="advanced: GLM vision preparation kernel directory; manifest/cubin contents enter the package cache identity")
     from .help import recipe_help
 
     running.usage = "%(prog)s [MODEL] [options]"

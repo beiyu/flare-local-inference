@@ -14,6 +14,7 @@ steps take Python's time rather than the graph's, schedules instead.
 """
 
 import json
+from dataclasses import replace
 import math
 import os
 import queue
@@ -97,11 +98,12 @@ def _sampling(body, defaults):
             raise AdmissionError(f"{name} must be an integer")
         return value if name == "seed" else clamp(name, value, default)
 
-    return SamplingParameters(
+    sampling = SamplingParameters(
         seed=integer("seed", int(defaults.get("seed", 0))), temperature=number("temperature"),
         top_p=number("top_p"), min_p=number("min_p"), repetition_penalty=number("repetition_penalty"),
         presence_penalty=number("presence_penalty"), frequency_penalty=number("frequency_penalty"),
         top_k=integer("top_k", int(defaults.get("top_k", -1))))
+    return replace(sampling, top_k=1, top_p=1., min_p=0.) if sampling.temperature == 0 else sampling
 
 
 class DirectServer:

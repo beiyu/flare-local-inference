@@ -242,7 +242,10 @@ def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
 @pytest.mark.parametrize("ring", [False, True])
 def test_roce_setup_preserves_routing_and_package_transport_owner(monkeypatch, ring):
     import sys
+    from ignition.preparation import collectives
     from ignition.preparation.collectives import create_roce_runtime
+
+    monkeypatch.setattr(collectives, "discover_roce_devices", lambda: (["rail0", "rail1"], 3))
 
     class Runtime:
         def __init__(self, *, ring=False, **options):
@@ -253,6 +256,8 @@ def test_roce_setup_preserves_routing_and_package_transport_owner(monkeypatch, r
     runtime = create_roce_runtime(object(), "cuda:0", max_tokens=32, pipe_tokens=4096,
                                   hidden_size=4096, gather_bytes=4096, ring=ring, package_storage=storage)
     assert runtime.ring is ring and storage.transports == [runtime]
+    assert runtime.options["hca_names"] == ["rail0", "rail1"]
+    assert runtime.options["gid_index"] == 3
     assert runtime.options["max_size"] == 2 << 20
     assert runtime.options["pipe_bytes"] == 4096 * 4096 * 2
     assert callable(runtime.options["region_allocator"])

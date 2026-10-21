@@ -263,7 +263,10 @@ impl OrbitPush {
             package: PathBuf::from(&self.package),
             host: "127.0.0.1".parse().unwrap(),
             port: 8000,
-            served_model_name: None,
+            served_model_name: vec![],
+            default_stop_scope: "all".into(),
+            default_max_new_tokens: None,
+            max_images_per_prompt: None,
             roce_ring: false,
             rendezvous: None,
             rank: None,
@@ -340,9 +343,22 @@ pub struct OrbitRun {
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub port: Option<u16>,
 
-    /// Replace the package's serving alias; the canonical model ID remains accepted.
-    #[arg(long, value_name = "ALIAS", value_parser = served_model_name, help_heading = "Serving options")]
-    pub served_model_name: Option<String>,
+    /// Replace package aliases; repeat in order, with the first used in responses.
+    #[arg(long, value_name = "ALIAS", value_parser = served_model_name,
+        action = clap::ArgAction::Append, help_heading = "Serving options")]
+    pub served_model_name: Vec<String>,
+
+    /// String-stop scope when a request omits it [default: saved group or all].
+    #[arg(long, value_name = "SCOPE", value_parser = ["all", "after_reasoning"], help_heading = "Serving options")]
+    pub default_stop_scope: Option<String>,
+
+    /// Output limit for requests that omit it [default: saved group or package].
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64), help_heading = "Serving options")]
+    pub default_max_new_tokens: Option<u32>,
+
+    /// Limit images in one prompt without changing the prepared feature window.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64), help_heading = "Serving options")]
+    pub max_images_per_prompt: Option<u32>,
 
     /// Favor throughput or output cadence [default: saved group or balanced].
     #[arg(long, value_name = "MODE",
@@ -386,8 +402,17 @@ impl OrbitRun {
         if let Some(port) = self.port {
             options.extend(["--port".into(), port.to_string()]);
         }
-        if let Some(name) = &self.served_model_name {
+        for name in &self.served_model_name {
             options.extend(["--served-model-name".into(), name.clone()]);
+        }
+        if let Some(scope) = &self.default_stop_scope {
+            options.extend(["--default-stop-scope".into(), scope.clone()]);
+        }
+        if let Some(limit) = self.default_max_new_tokens {
+            options.extend(["--default-max-new-tokens".into(), limit.to_string()]);
+        }
+        if let Some(limit) = self.max_images_per_prompt {
+            options.extend(["--max-images-per-prompt".into(), limit.to_string()]);
         }
         if let Some(policy) = &self.scheduler_policy {
             options.extend(["--scheduler-policy".into(), policy.clone()]);
@@ -405,6 +430,9 @@ impl OrbitRun {
             host: self.host.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
             port: self.port.unwrap_or(8000),
             served_model_name: self.served_model_name.clone(),
+            default_stop_scope: self.default_stop_scope.clone().unwrap_or_else(|| "all".into()),
+            default_max_new_tokens: self.default_max_new_tokens,
+            max_images_per_prompt: self.max_images_per_prompt,
             roce_ring: self.roce_ring,
             rendezvous: None,
             rank: None,
@@ -456,9 +484,23 @@ pub struct Run {
     )]
     pub port: u16,
 
-    /// Replace the package's serving alias; the canonical model ID remains accepted.
-    #[arg(long, value_name = "ALIAS", value_parser = served_model_name, help_heading = "Serving options")]
-    pub served_model_name: Option<String>,
+    /// Replace package aliases; repeat in order, with the first used in responses.
+    #[arg(long, value_name = "ALIAS", value_parser = served_model_name,
+        action = clap::ArgAction::Append, help_heading = "Serving options")]
+    pub served_model_name: Vec<String>,
+
+    /// String-stop scope when a request omits it or sets it to null; explicit request values win.
+    #[arg(long, value_name = "SCOPE", default_value = "all",
+        value_parser = ["all", "after_reasoning"], help_heading = "Serving options")]
+    pub default_stop_scope: String,
+
+    /// Output limit for requests that omit it; omission preserves the package default.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64), help_heading = "Serving options")]
+    pub default_max_new_tokens: Option<u32>,
+
+    /// Limit images in one prompt without changing the prepared feature window.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64), help_heading = "Serving options")]
+    pub max_images_per_prompt: Option<u32>,
 
     /// Experimental ring in rank order: only neighbor RoCE QPs connect;
     /// native CPU relays forward non-neighbor traffic. Also emulates a ring on a switch.
@@ -895,8 +937,9 @@ mod tests {
     fn omitted_limits_preserve_package_defaults() {
         let args = run(&["flare", "run", "model.safetensors"]);
         assert_eq!(args.bind_address().to_string(), "127.0.0.1:8000");
-        assert_eq!(args.served_model_name, None);
+        assert!(args.served_model_name.is_empty());
         assert_eq!(args.scheduler_policy, "balanced");
+        assert_eq!(args.default_stop_scope, "all");
         let options = args.load_options();
         assert_eq!(options.device_labels, Some(vec![0]));
         assert_eq!(options.embedding_table_storage, None);
@@ -909,6 +952,37 @@ mod tests {
         assert_eq!(options.mtp_max_verification_token_budget, None);
         assert_eq!(options.adaptive_verification, None);
         assert_eq!(options.prefix_cache, PrefixCacheOffload::default());
+    }
+
+    #[test]
+    fn string_stop_scope_default_is_explicit_and_validated() {
+        for scope in ["all", "after_reasoning"] {
+            assert_eq!(run(&["flare", "run", "model", "--default-stop-scope", scope]).default_stop_scope, scope);
+        }
+        for scope in ["answer", "ALL", ""] {
+            assert!(Cli::try_parse_from(["flare", "run", "model", "--default-stop-scope", scope]).is_err());
+        }
+        let Command::Orbit(orbit) = Cli::try_parse_from([
+            "flare", "orbit", "run", "model", "--default-stop-scope", "after_reasoning",
+        ]).unwrap().command else { panic!() };
+        let OrbitCommand::Run(orbit) = orbit.command else { panic!() };
+        assert_eq!(orbit.rank_zero_options(), ["--default-stop-scope", "after_reasoning"]);
+        assert_eq!(orbit.run_args().default_stop_scope, "after_reasoning");
+    }
+
+    #[test]
+    fn default_output_limit_is_optional_bounded_and_forwarded_to_orbit() {
+        assert_eq!(run(&["flare", "run", "model"]).default_max_new_tokens, None);
+        assert_eq!(run(&["flare", "run", "model", "--default-max-new-tokens", "65536"]).default_max_new_tokens, Some(65536));
+        for value in ["0", "-1", "2147483648", "1.5"] {
+            assert!(Cli::try_parse_from(["flare", "run", "model", "--default-max-new-tokens", value]).is_err());
+        }
+        let Command::Orbit(orbit) = Cli::try_parse_from([
+            "flare", "orbit", "run", "model", "--default-max-new-tokens", "65536",
+        ]).unwrap().command else { panic!() };
+        let OrbitCommand::Run(orbit) = orbit.command else { panic!() };
+        assert_eq!(orbit.rank_zero_options(), ["--default-max-new-tokens", "65536"]);
+        assert_eq!(orbit.run_args().default_max_new_tokens, Some(65536));
     }
 
     #[test]
@@ -1110,7 +1184,7 @@ mod tests {
                 "--served-model-name",
                 name,
             ]);
-            assert_eq!(args.served_model_name.as_deref(), Some(name));
+            assert_eq!(args.served_model_name, [name]);
         }
         for name in ["", " ", "\t"] {
             assert!(
@@ -1123,6 +1197,34 @@ mod tests {
                 ])
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn served_model_name_repetitions_preserve_order_and_orbit_forwarding() {
+        let names = ["GLM-5.3-Flash", "spark/GLM-5.3-Flash", "local model"];
+        let mut arguments = vec!["flare", "run", "model.safetensors"];
+        for name in names {
+            arguments.extend(["--served-model-name", name]);
+        }
+        assert_eq!(run(&arguments).served_model_name, names);
+        arguments.insert(1, "orbit");
+        let Command::Orbit(orbit) = Cli::try_parse_from(&arguments).unwrap().command else { panic!() };
+        let OrbitCommand::Run(orbit) = orbit.command else { panic!() };
+        assert_eq!(orbit.served_model_name, names);
+        assert_eq!(orbit.run_args().served_model_name, names);
+        let forwarded = orbit.rank_zero_options();
+        assert_eq!(forwarded, names.into_iter().flat_map(|name| ["--served-model-name", name])
+            .map(str::to_owned).collect::<Vec<_>>());
+        let mut native = vec!["flare", "run", "model.safetensors"];
+        native.extend(forwarded.iter().map(String::as_str));
+        assert_eq!(run(&native).served_model_name, names);
+        for command in [vec!["flare", "run", "model"], vec!["flare", "orbit", "run", "model"]] {
+            for blank in ["", " ", "\t"] {
+                let mut invalid = command.clone();
+                invalid.extend(["--served-model-name", names[0], "--served-model-name", blank]);
+                assert!(Cli::try_parse_from(invalid).is_err());
+            }
         }
     }
 
@@ -1200,4 +1302,18 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn image_count_limit_is_positive_optional_and_forwarded_to_orbit() {
+        assert_eq!(run(&["flare", "run", "model"]).max_images_per_prompt, None);
+        assert_eq!(run(&["flare", "run", "model", "--max-images-per-prompt", "20"]).max_images_per_prompt, Some(20));
+        for value in ["0", "-1", "2147483648"] {
+            assert!(Cli::try_parse_from(["flare", "run", "model", "--max-images-per-prompt", value]).is_err());
+        }
+        let cli = Cli::try_parse_from(["flare", "orbit", "run", "model", "--max-images-per-prompt", "20"]).unwrap();
+        let Command::Orbit(orbit) = cli.command else { panic!("expected orbit") };
+        let OrbitCommand::Run(orbit) = orbit.command else { panic!("expected orbit run") };
+        assert_eq!(orbit.run_args().max_images_per_prompt, Some(20));
+        assert!(orbit.rank_zero_options().windows(2).any(|pair| pair == ["--max-images-per-prompt", "20"]));
+    }
+
 }

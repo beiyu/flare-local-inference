@@ -635,3 +635,131 @@ def test_no_weights_requires_cache_before_preparation(host, tmp_path, capsys):
     assert 'existing blob cache' in capsys.readouterr().err
     assert main(['export', 'qwen3.8-flash', '--repo-id', '../escape', '--output', str(tmp_path / 'output')]) == 2
     assert host['exports'] == 0
+
+
+@pytest.fixture
+def preparation_source_tree(monkeypatch, tmp_path):
+    # These CLI tests already replace model preparation/export. Supply a source
+    # tree for its independent rebuild-identity scan without importing CUDA tools.
+    package = tmp_path / "preparation_sources" / "flashinfer"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("# CLI source-identity fixture\n")
+    monkeypatch.syspath_prepend(str(package.parent))
+
+
+def test_default_string_stop_scope_is_runtime_only_and_requests_can_override(host, preparation_source_tree):
+    assert run("qwen3.8-flash") == 0
+    package = host["exec"][2]
+    assert host["exec"][host["exec"].index("--default-stop-scope") + 1] == "all"
+    assert run("qwen3.8-flash", "--default-stop-scope", "after_reasoning") == 0
+    assert host["exec"][host["exec"].index("--default-stop-scope") + 1] == "after_reasoning"
+    assert host["exec"][2] == package and host["exports"] == 1
+    assert "default_stop_scope" not in host["options"]
+    path = Path.home() / ".config/flare/config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[server]\ndefault_stop_scope = "after_reasoning"\n')
+    assert run("qwen3.8-flash") == 0
+    assert host["exec"][host["exec"].index("--default-stop-scope") + 1] == "after_reasoning"
+    assert run("qwen3.8-flash", "--default-stop-scope", "all") == 0
+    assert host["exec"][host["exec"].index("--default-stop-scope") + 1] == "all"
+    assert host["exec"][2] == package and host["exports"] == 1
+
+
+def test_default_output_limit_forwards_without_exporting_or_changing_cached_package(host, preparation_source_tree):
+    assert run("qwen3.8-flash") == 0
+    package = host["exec"][2]
+    assert "--default-max-new-tokens" not in host["exec"]
+    assert run("qwen3.8-flash", "--default-max-new-tokens", "65536") == 0
+    assert host["exec"][host["exec"].index("--default-max-new-tokens") + 1] == "65536"
+    assert host["exec"][2] == package and host["exports"] == 1
+    assert "max_new_tokens" not in host["options"]
+
+
+@pytest.mark.parametrize("library_field", ["exl3_library", "exl3_prefill_library"])
+def test_package_cache_key_includes_exl3_library_bytes(tmp_path, monkeypatch, preparation_source_tree, library_field):
+    # Dependency versions are constant inputs; this case tests actual library
+    # bytes independently of installed CUDA wheels and absolute library paths.
+    monkeypatch.setattr(runtime.metadata, "version", lambda name: "fixed-test-version")
+    model = resolve("qwen3.8-flash")
+    gpu = planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-test", 96 * GIB, FREE, (12, 0))
+    plan = planning.fit(model.recipe, model.checkpoint, (gpu,), concurrency=4,
+                        reserve_bytes=0, speculation=model.recipe.speculation)
+    original = runtime.package_key(model, plan, False)
+    library = tmp_path / "cooperative.so"; library.write_bytes(b"first")
+    first = runtime.package_key(model, replace(plan, **{library_field: library}), False)
+    assert first != original
+    library.write_bytes(b"second")
+    assert runtime.package_key(model, replace(plan, **{library_field: library}), False) != first
+    alias = tmp_path / "same.so"; alias.write_bytes(b"first")
+    assert runtime.package_key(model, replace(plan, **{library_field: alias}), False) == first
+
+
+def test_vision_preparation_directory_reaches_plan_without_becoming_native_flag(host, tmp_path, preparation_source_tree):
+    kernels = tmp_path / "vision"; kernels.mkdir()
+    (kernels / "manifest.json").write_text('{"version":1}')
+    assert main(["run", "qwen3.8-flash", "--port", str(free_port()),
+                 "--glm-vision-kernels", str(kernels)]) == 0
+    assert host["plan"].glm_vision_kernels == kernels.resolve()
+    assert host["plan"].to_dict()["glm_vision_kernels"] == str(kernels.resolve())
+    assert "--glm-vision-kernels" not in host["exec"]
+
+
+def test_package_cache_key_tracks_vision_manifest_cubin_bytes_and_relative_paths(
+        tmp_path, monkeypatch, preparation_source_tree):
+    import shutil
+    monkeypatch.setattr(runtime.metadata, "version", lambda name: "fixed-test-version")
+    model = resolve("qwen3.8-flash")
+    gpu = planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-test", 96 * GIB, FREE, (12, 0))
+    plan = planning.fit(model.recipe, model.checkpoint, (gpu,), concurrency=4,
+                        reserve_bytes=0, speculation=model.recipe.speculation)
+    kernels = tmp_path / "vision"; kernels.mkdir()
+    manifest = kernels / "manifest.json"; manifest.write_text('{"version":1}')
+    subdir = kernels / "sm121"; subdir.mkdir()
+    cubin = subdir / "rms.cubin"; cubin.write_bytes(b"first kernel")
+    extra = subdir / "qk.cubin"; extra.write_bytes(b"second kernel")
+    configured = replace(plan, glm_vision_kernels=kernels)
+    first = runtime.package_key(model, configured, False)
+    assert first != runtime.package_key(model, plan, False)
+    (kernels / "notes.txt").write_text("not a preparation input")
+    assert runtime.package_key(model, configured, False) == first
+    alias = tmp_path / "relocated"; shutil.copytree(kernels, alias)
+    assert runtime.package_key(model, replace(plan, glm_vision_kernels=alias), False) == first
+    manifest.write_text('{"version":2}')
+    assert runtime.package_key(model, configured, False) != first
+    manifest.write_text('{"version":1}')
+    extra.write_bytes(b"changed second kernel")
+    assert runtime.package_key(model, configured, False) != first
+    extra.write_bytes(b"second kernel")
+    cubin.rename(subdir / "renamed.cubin")
+    assert runtime.package_key(model, configured, False) != first
+
+
+@pytest.mark.parametrize("images,image_bytes,expected", [
+    (0, 0, 32 << 20),
+    (1, (224 << 20) - 1, (256 << 20) - 1),
+    (1, 224 << 20, 256 << 20),
+    (1, (224 << 20) + 1, 256 << 20),
+    (20, 2048 * 4096 * 2, 256 << 20),
+])
+def test_produced_http_body_budget_respects_existing_native_limit(
+        tmp_path, images, image_bytes, expected):
+    # The shared native Server::start contract permits at most 256 MiB. Exercise
+    # the real GLM declaration/Plan: its EXL3 image variant's 20 * 16 MiB +
+    # 1M * 32 byte estimate is 352 MiB, which must not become a startup error.
+    base = resolve("glm-5.3-flash")
+    recipe = replace(base.recipe, max_images=images, image_bytes=image_bytes)
+    model = ResolvedModel(recipe, base.checkpoint)
+    gpus = tuple(planning.Gpu(index, "NVIDIA GB10", f"GPU-test-{index}",
+                             121 * GIB, 118 * GIB, (12, 1)) for index in range(2))
+    plan = planning.fit(recipe, model.checkpoint, gpus, concurrency=4,
+                        reserve_bytes=0, speculation=None, image_concurrency=int(images > 0))
+    assert isinstance(plan, planning.Plan) and plan.recipe.context == 1048576
+    config = tmp_path / "config.toml"; config.write_text("")
+    options = serve._server_options(Configuration.load(config), model, plan)
+    estimated = plan.max_images * image_bytes + plan.recipe.context * 32
+    assert 0 < options["max_body_bytes"] <= 256 * 1024 * 1024
+    assert options["max_body_bytes"] == expected
+    if estimated <= 256 << 20:
+        assert options["max_body_bytes"] == estimated
+    if images == 20:
+        assert estimated == 369098752

@@ -652,7 +652,7 @@ impl ModelRuntime {
             super::stops::validate_strings(
                 &prompt.stop_strings,
                 !prompt.stop_sequences.is_empty(),
-                prompt.grammar.is_some(),
+                prompt.grammar.as_ref().is_some_and(crate::grammar::RequestGrammar::is_structured),
             )?;
             super::stops::validate_initial_reasoning(prompt.string_stop_reasoning.as_ref())?;
             crate::model::admission::validate_prompt(&self.config, &prompt)

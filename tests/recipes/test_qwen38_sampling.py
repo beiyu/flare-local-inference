@@ -41,7 +41,7 @@ def test_philox_random123_zero_vector_and_uniform_distribution():
 
 @pytest.mark.parametrize("changes", [
     {"seed": -1}, {"seed": 2**64}, {"generation": 0}, {"generation": True},
-    {"temperature": 0.}, {"temperature": -0.}, {"temperature": -1}, {"temperature": float("nan")}, {"top_p": 0},
+    {"temperature": -1}, {"temperature": float("nan")}, {"top_p": 0},
     {"temperature": 1e-100}, {"repetition_penalty": 1e100},
     {"min_p": 1.1}, {"repetition_penalty": 0}, {"top_k": 248321},
     {"max_new_tokens": -1}, {"eos_token_ids": tuple(range(9))},
@@ -353,7 +353,8 @@ def test_consumption_strided_live_history_and_pending_guard():
 
 @CUDA
 @pytest.mark.parametrize("capacity", [1, 2, 4])
-def test_native_admission_scatter_preserves_restored_state_and_gates_final_sampling(capacity):
+@pytest.mark.parametrize("temperature", [0., 1.])
+def test_native_admission_scatter_preserves_restored_state_and_gates_final_sampling(capacity, temperature):
     state = DeviceRequestState.allocate("cuda", vocab_size=32)
     for slot in range(4):
         state.admit(slot, RequestAdmission(1, 100 + slot, eos_token_ids=()), [1, 2, 3],
@@ -363,7 +364,7 @@ def test_native_admission_scatter_preserves_restored_state_and_gates_final_sampl
     order = [3, 1, 0, 2]
     for row, slot in enumerate(order[:capacity]):
         buffers.stage(row, slot, RequestAdmission(17 + slot, 2**64 - 1 - slot,
-            temperature=1., eos_token_ids=()), [4, 4, 5, 6])
+            temperature=temperature, eos_token_ids=()), [4, 4, 5, 6])
         state.ple_history[slot].copy_(torch.tensor([4, 5]))
     buffers.admission_count.fill_(capacity)
     metadata = _metadata()
@@ -417,7 +418,7 @@ def test_native_admission_scatter_preserves_restored_state_and_gates_final_sampl
 
 
 @CUDA
-@pytest.mark.parametrize("fault", ["duplicate", "negative_histogram", "stale_epoch", "invalid_parameters", "zero_temperature", "negative_zero_temperature"])
+@pytest.mark.parametrize("fault", ["duplicate", "negative_histogram", "stale_epoch", "invalid_parameters", "negative_temperature", "subnormal_temperature"])
 def test_native_admission_errors_do_not_partially_mutate_resident_slots(fault):
     state = DeviceRequestState.allocate("cuda", vocab_size=32)
     state.admit(2, RequestAdmission(3, 71, eos_token_ids=()), [2, 2, 7], consumed_tokens=3, ple_history=(2, 7))
@@ -432,10 +433,10 @@ def test_native_admission_errors_do_not_partially_mutate_resident_slots(fault):
         buffers.admission_histogram[0, 31] = -1
     elif fault == "stale_epoch":
         buffers.admission_generations[0] = 3
-    elif fault == "zero_temperature":
-        buffers.admission_parameters[0, 0] = 0.
-    elif fault == "negative_zero_temperature":
-        buffers.admission_parameters[0, 0] = -0.
+    elif fault == "negative_temperature":
+        buffers.admission_parameters[0, 0] = -1.
+    elif fault == "subnormal_temperature":
+        buffers.admission_parameters[0, 0] = 1e-40
     else:
         buffers.admission_parameters[0, 0] = float("nan")
     _, _, _, records, frame, sequence = _metadata()

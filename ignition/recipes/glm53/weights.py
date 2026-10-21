@@ -1,4 +1,4 @@
-"""GLM checkpoint weights partitioned for b12x TP2 and TP4 execution."""
+"""GLM checkpoint weights with explicit stored precision and tensor-parallel slices."""
 
 from __future__ import annotations
 
@@ -60,10 +60,11 @@ class ModelWeights:
     expert_scale_scratch: tuple[torch.Tensor, torch.Tensor] | None
     allocated_bytes: int
     mtp: MTPWeights | None = None
+    exl3_workspace: object | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=False, expert_activation="a4",
-             expand_expert_scales=False):
+             expand_expert_scales=False, exl3_library=None, exl3_prefill_library=None, exl3_prefill_capacity=4096):
         import torch
 
         from .model import create_model_tree
@@ -79,7 +80,12 @@ class ModelWeights:
         layers = []
         with GlmWeightLoader(manifest, device, shard=shard,
                              progress=progress if shard.rank == 0 else None,
-                             expert_activation=expert_activation) as loader:
+                             expert_activation=expert_activation, exl3_library=exl3_library,
+                             exl3_prefill_library=exl3_prefill_library, exl3_prefill_capacity=exl3_prefill_capacity) as loader:
+            if loader.is_exl3 and exl3_prefill_library is None:
+                raise ValueError("complete EXL3 preparation requires the original thin/E3 prefill extension")
+            if loader.is_exl3 and mtp:
+                raise ValueError("EXL3 target weights do not contain the deployed DFlash draft; MTP substitution is unsupported")
             names = [f"{TEXT_PREFIX}.embed_tokens.weight", f"{TEXT_PREFIX}.norm.weight"]
             for name in names:
                 path, attribute = name.rsplit(".", 1)
@@ -88,7 +94,7 @@ class ModelWeights:
             tree.lm_head.weight = torch.nn.Parameter(loader.load_tensor("lm_head.weight",
                 extent=slice(*shard.partition(tree.lm_head.out_features, alignment=64))), requires_grad=False)
             tree.lm_head.out_features = tree.lm_head.weight.shape[0]
-            scales = None if expand_expert_scales else loader.allocate_expert_scale_scratch()
+            scales = None if expand_expert_scales or loader.is_exl3 else loader.allocate_expert_scale_scratch()
             for index in range(len(tree.model.language_model.layers)):
                 layers.append(LayerWeights(loader.load_attention(index), loader.load_mlp(index, scale_scratch=scales),
                                            loader.load_residual(index)))
@@ -98,7 +104,8 @@ class ModelWeights:
 
                 draft = replace(draft, draft_head=nvfp4_draft_head(tree.lm_head.weight))
         torch.cuda.synchronize(device)
-        return cls(tree, shard, tuple(layers), scales, torch.cuda.memory_allocated(device) - before, draft)
+        return cls(tree, shard, tuple(layers), scales, torch.cuda.memory_allocated(device) - before, draft,
+                   loader.exl3_workspace)
 
 
 class GlmWeightLoader(DirectWeightLoader):
@@ -111,7 +118,7 @@ class GlmWeightLoader(DirectWeightLoader):
     """
 
     def __init__(self, manifest: IndexedCheckpoint, device, *, shard: TensorParallelShard,
-                 prefixes=None, progress=None, expert_activation="a4"):
+                 prefixes=None, progress=None, expert_activation="a4", exl3_library=None, exl3_prefill_library=None, exl3_prefill_capacity=4096):
         super().__init__(manifest, device, prefixes=prefixes,
                          progress=progress)
         self.shard = shard
@@ -123,14 +130,25 @@ class GlmWeightLoader(DirectWeightLoader):
         if (config.get("model_type") != "glm5_next"
                 or config.get("architectures") != ["Glm5NextForConditionalGeneration"]):
             raise ValueError("GLM weights require Glm5NextForConditionalGeneration")
+        self.is_exl3 = config.get("quantization_config", {}).get("quant_method") == "exl3"
+        self.exl3_library, self.exl3_workspace = exl3_library, None
+        self.exl3_prefill_library, self.exl3_prefill_capacity = exl3_prefill_library, exl3_prefill_capacity
+        if self.is_exl3:
+            from ignition.preparation.exl3 import validate_config
+
+            validate_config(config, shard.world_size)
+            if exl3_library is None:
+                raise ValueError("EXL3 preparation requires an explicit cooperative library path")
         text = config["text_config"]
+        from .model import validate_linear_attention_config
+
+        validate_linear_attention_config(text)
         for key, expected in {
             "hidden_size": 4096, "num_hidden_layers": 45, "intermediate_size": 12288,
             "moe_intermediate_size": 2048, "n_routed_experts": 288, "n_shared_experts": 1,
             "first_k_dense_replace": 3, "num_attention_heads": 64, "q_lora_rank": 1536,
             "kv_lora_rank": 512, "qk_nope_head_dim": 256, "qk_rope_head_dim": 0,
-            "v_head_dim": 256, "linear_num_heads": 64, "linear_head_dim": 128,
-            "linear_conv_kernel_dim": 4, "index_n_heads": 32, "index_head_dim": 128,
+            "v_head_dim": 256, "index_n_heads": 32, "index_head_dim": 128,
             "swiglu_limit": 10.0, "hc_mult": 4,
         }.items():
             if text.get(key) != expected:
@@ -146,7 +164,40 @@ class GlmWeightLoader(DirectWeightLoader):
         return f"{TEXT_PREFIX}.layers.{layer}"
 
     def _projection(self, prefix, *, rows=None, columns=None):
-        return self.load_linear(prefix, rows=rows, columns=columns)
+        return self.load_linear_group((prefix,), row_ranges=(rows,), column_range=columns)
+
+    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
+        if not self.is_exl3:
+            return super().load_linear_group(prefixes, row_ranges=row_ranges, column_range=column_range)
+        import torch
+
+        prefixes = tuple(prefixes)
+        if not prefixes:
+            raise ValueError("GLM projection group must be nonempty")
+        ranges = (None,) * len(prefixes) if row_ranges is None else tuple(row_ranges)
+        if len(ranges) != len(prefixes):
+            raise ValueError("GLM projection ranges must match their source tensors")
+        tensors = []
+        for prefix, rows in zip(prefixes, ranges, strict=True):
+            name = prefix + ".weight"
+            metadata = self.manifest.tensors.get(name)
+            if metadata is None or metadata.dtype != "BF16" or len(metadata.shape) != 2:
+                raise ValueError(f"{name}: routed-only EXL3 requires stored BF16 non-routed projections")
+            def extent(bounds, size):
+                if bounds is None:
+                    return slice(None)
+                first, last = bounds
+                if type(first) is not int or type(last) is not int or not 0 <= first < last <= size:
+                    raise ValueError(f"{name}: invalid BF16 projection extent")
+                return slice(first, last)
+            tensor = self.load_tensor(name, extent=(extent(rows, metadata.shape[0]),
+                extent(column_range, metadata.shape[1])))
+            if tensor.dtype != torch.bfloat16:
+                raise ValueError(f"{name}: loader changed checkpoint precision")
+            tensors.append(tensor)
+        if len({tensor.shape[1] for tensor in tensors}) != 1:
+            raise ValueError("fused BF16 projection input widths differ")
+        return tensors[0] if len(tensors) == 1 else torch.cat(tensors)
 
     def load_attention(self, layer):
         prefix = self._layer(layer) + ".self_attn"
@@ -157,10 +208,14 @@ class GlmWeightLoader(DirectWeightLoader):
         # Every projection of the layer input shares one GEMM: low-rank query, latent, index key and head weights.
         result["qkv_a_proj"] = self.load_linear_group(
             tuple(f"{prefix}.{name}" for name in ("q_a_proj", "kv_a_proj_with_mqa", "indexer.wk", "indexer.weights_proj")))
+        if self.is_exl3:
+            # The deployment evaluates index head gates in FP32, independently of the BF16 key projection.
+            # Reuse this exact BF16 checkpoint view; the projection's FP32 output avoids a BF16 roundtrip.
+            result["indexer.weights_proj"] = result["qkv_a_proj"][-32:]
         result["q_b_proj"] = self._projection(f"{prefix}.q_b_proj", rows=head_channels)
         from ignition.preparation.quantization import linear_format
 
-        if linear_format(self.quantization, f"{prefix}.kv_b_proj") != "mxfp8":
+        if not self.is_exl3 and linear_format(self.quantization, f"{prefix}.kv_b_proj") != "mxfp8":
             raise ValueError(f"{prefix}.kv_b_proj: MLA absorption requires MXFP8 weights")
         result["kv_b_proj"] = self.load_linear_group(
             (f"{prefix}.kv_b_proj",), row_ranges=(self.shard.partition(64 * 512, alignment=512),))
@@ -212,7 +267,7 @@ class GlmWeightLoader(DirectWeightLoader):
         )
         from ignition.preparation.quantization import expert_format
 
-        csf = expert_format(self.quantization, prefix + ".experts")[0] == "nvfp4_csf"
+        csf = not self.is_exl3 and expert_format(self.quantization, prefix + ".experts")[0] == "nvfp4_csf"
         return MoEWeights(
             self.load_tensor(f"{prefix}.gate.weight"),
             self.load_tensor(f"{prefix}.gate.e_score_correction_bias"),
@@ -228,6 +283,8 @@ class GlmWeightLoader(DirectWeightLoader):
         if (not ids or len(set(ids)) != len(ids)
                 or any(type(i) is not int or not 0 <= i < 288 for i in ids)):
             raise ValueError("GLM expert IDs must be distinct integers in [0, 288)")
+        if self.is_exl3:
+            return self._load_exl3_experts(layer, ids)
         prefixes = tuple(f"{prefix}.{i}" for i in ids)
         from ignition.preparation.quantization import expert_format
 
@@ -244,9 +301,34 @@ class GlmWeightLoader(DirectWeightLoader):
             swiglu_limit=10.0, activation_mode=self.expert_activation,
         )
 
+    def _load_exl3_experts(self, layer, ids):
+        from ignition.components.exl3 import Exl3Experts, Exl3Workspace
+        from ignition.preparation.exl3 import MCG_MARKER, tensor_contract, tensor_extent, validate_tensors
+
+        validate_tensors(self.manifest, layer, ids)
+        if self.exl3_workspace is None:
+            self.exl3_workspace = Exl3Workspace(self.exl3_library, self.device,
+                prefill_library=self.exl3_prefill_library, prefill_capacity=self.exl3_prefill_capacity)
+        tensors = []
+        for expert in ids:
+            planes = {}
+            names = tuple(tensor_contract(layer, expert))
+            extents = tuple(tensor_extent(*name.rsplit(".", 2)[-2:], self.shard.rank) for name in names)
+            for name, value in zip(names, self.load_tensors(names, extents=extents), strict=True):
+                projection, suffix = name.rsplit(".", 2)[-2:]
+                if suffix == "mcg":
+                    if value.item() != MCG_MARKER:
+                        raise ValueError(f"{name}: invalid EXL3 MCG marker")
+                else:
+                    planes[f"{projection}.{suffix}"] = value
+            tensors.append(planes)
+        return Exl3Experts.from_tensors(tensors, self.exl3_workspace)
+
     def allocate_expert_scale_scratch(self, expert_count=288):
         import torch
 
+        if self.is_exl3:
+            raise ValueError("EXL3 experts have no NVFP4 scale-expansion workspace")
         if type(expert_count) is not int or not 1 <= expert_count <= 288:
             raise ValueError("GLM expert count must be in [1, 288]")
         local = 2048 // self.shard.world_size

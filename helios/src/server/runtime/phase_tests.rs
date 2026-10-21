@@ -1840,6 +1840,7 @@ fn http_state(
         input_store: None,
     });
     Arc::new(HttpState {
+        response_model: "test-model".into(),
         model,
         frontend: Arc::new(fixture.frontend),
         images: None,
@@ -1851,6 +1852,7 @@ fn http_state(
         ingress_capacity: 4,
         ids: Default::default(),
         api_key,
+        default_stop_scope: super::super::StringStopScope::All,
         context_hint: String::new(),
         capacity_hint: String::new(),
         started: std::time::Instant::now(),
@@ -1958,6 +1960,7 @@ async fn http_stream_starts_on_one_admission_and_late_failure_has_no_success_ter
         .unwrap();
     let body = std::str::from_utf8(&bytes).unwrap();
     assert!(body.contains("\"text\":\"b\""), "{body}");
+    assert!(body.contains("\"model\":\"test-model\""), "{body}");
     assert!(body.contains("\"code\":\"server_unavailable\""), "{body}");
     assert!(!body.contains("[DONE]"), "{body}");
     assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");

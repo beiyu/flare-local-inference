@@ -17,6 +17,7 @@ mod runtime;
 mod stops;
 pub(crate) mod token_spans;
 pub use config::Bootstrap;
+pub use inference::StringStopScope;
 pub use dashboard::view;
 pub use metrics::Snapshot;
 pub use runtime::{Generation, GenerationEvent, ModelRuntime, Prompt};
@@ -64,6 +65,8 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     /// Names requests may use for the model in addition to its identifier.
     pub served_names: Vec<String>,
+    /// String-stop scope for requests that omit it or set it to null.
+    pub default_stop_scope: StringStopScope,
     /// Setting that raises the per-request context, appended to context rejections.
     pub context_hint: String,
     /// Setting that raises request or page capacity, appended to capacity rejections.
@@ -80,6 +83,7 @@ impl Default for ServerConfig {
             max_body_bytes: 32 * 1024 * 1024,
             api_key: None,
             served_names: Vec::new(),
+            default_stop_scope: StringStopScope::All,
             context_hint: String::new(),
             capacity_hint: String::new(),
             scheduling_policy: crate::scheduler::PolicyConfig::default(),
@@ -100,6 +104,8 @@ struct HttpState {
     ingress_capacity: usize,
     ids: AtomicU64,
     api_key: Option<String>,
+    default_stop_scope: StringStopScope,
+    response_model: String,
     context_hint: String,
     capacity_hint: String,
     started: Instant,
@@ -212,6 +218,8 @@ impl Server {
             ingress_capacity,
             ids: AtomicU64::new(1),
             api_key: config.api_key.clone(),
+            default_stop_scope: config.default_stop_scope,
+            response_model: models::serving_name(model.config(), &config.served_names).to_owned(),
             context_hint: config.context_hint.clone(),
             capacity_hint: config.capacity_hint.clone(),
             started: Instant::now(),
@@ -385,7 +393,7 @@ impl Drop for Server {
 /// and metrics expose no request content and stay unauthenticated.
 fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize) -> Router {
     Router::new()
-        .merge(models::router(state.model.config(), served_names))
+        .merge(models::router(state.model.config(), served_names, state.images.as_ref().map(|images| images.limits())))
         .route("/v1/chat/completions", post(http::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/completions", post(http::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/messages", post(http::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))

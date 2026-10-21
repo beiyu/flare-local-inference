@@ -471,6 +471,19 @@ mod tests {
     }
 
     #[test]
+    fn explicit_zero_temperature_range_survives_serialization() {
+        let mut value = defaults();
+        value.ranges = Some(wire::SamplingRanges {
+            temperature: Some(wire::SamplingFloatRange { min: Some(0.), max: Some(1.) }),
+            ..Default::default()
+        });
+        let decoded = wire::DefaultSamplingParameters::decode(value.encode_to_vec().as_slice()).unwrap();
+        let json = sampling_defaults(decoded).unwrap();
+        assert_eq!(json["temperature"], 1.);
+        assert_eq!(json["ranges"]["temperature"]["min"], 0.);
+    }
+
+    #[test]
     fn sampling_ranges_preserve_explicit_zero_bounds_and_reject_invalid_metadata() {
         let mut value = defaults();
         value.ranges = Some(wire::SamplingRanges {
@@ -502,7 +515,7 @@ mod tests {
         for (min, max) in [
             (None, Some(1.5)),
             (Some(0.5), None),
-            (Some(0.), Some(1.5)),
+            (Some(-0.5), Some(1.5)),
             (Some(1.5), Some(2.)),
             (Some(2.), Some(0.5)),
             (Some(f32::NAN), Some(1.5)),

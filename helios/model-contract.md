@@ -160,7 +160,10 @@ The only runtime frontend assets are tokenizer data and the chat template.
 EOS tokens, template tokens, image settings, and complete sampling defaults are
 typed Protobuf metadata. Recipes declare model-card sampling recommendations;
 Helios reads no checkpoint config files or model cards. Explicit request values
-win over prepared defaults.
+win over prepared defaults. Numeric distribution parameters follow their prepared
+ranges. A temperature range including zero admits exact argmax after penalties
+and grammar masking, with lowest-token-ID tie breaking; positive-range older
+packages retain their original zero-temperature clamping behavior.
 
 Frontend identifiers cannot select scheduling, cache policy, text-graph input
 packing, or completion behavior. Boolean flags, callbacks, schema names, and

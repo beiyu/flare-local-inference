@@ -107,7 +107,9 @@ def _select_and_sample(Candidates, Selected, Probabilities, Valid, TopK, TopP, P
 
     # Top-k keeps every candidate tied with the k-th score.
     pivot = tl.max(tl.where(rank == top_k - 1, scores, -float("inf")), 0)
-    kept = finite & (scores >= pivot)
+    greedy = tl.load(Params + slot * 6) == 0.
+    # Keys sort by score, then by ascending token ID, so rank zero is exact greedy.
+    kept = finite & (scores >= pivot) & (~greedy | (rank == 0))
     maximum = tl.max(tl.where(kept, scores, -float("inf")), 0)
     weights = tl.where(kept, tl.exp(scores - maximum), 0.)
     probabilities = weights / tl.sum(weights, 0)

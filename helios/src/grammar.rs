@@ -142,6 +142,39 @@ impl GrammarCompiler {
         })
     }
 
+    /// Reuse the captured sampling mask for request-local token exclusions.
+    pub(crate) fn exclude_tokens(
+        &self,
+        grammar: Option<RequestGrammar>,
+        tokens: &[u32],
+    ) -> Result<RequestGrammar> {
+        if tokens.is_empty()
+            || tokens
+                .iter()
+                .any(|&id| id as usize >= self.tokenizer_vocab || self.eos_ids.contains(&id))
+        {
+            return Err(Error::admission(
+                AdmissionError::Grammar,
+                "token exclusions must name non-EOS checkpoint tokens",
+            ));
+        }
+        let mut request = grammar.unwrap_or_else(|| RequestGrammar {
+            matcher: None,
+            forbidden: Vec::new(),
+            mask: vec![0; self.model_vocab.div_ceil(32)],
+            tokenizer_vocab: self.tokenizer_vocab,
+            eos_ids: self.eos_ids.clone(),
+            accepting: true,
+            stopped: false,
+            error: None,
+        });
+        request.forbidden.extend_from_slice(tokens);
+        request.forbidden.sort_unstable();
+        request.forbidden.dedup();
+        request.refresh_mask()?;
+        Ok(request)
+    }
+
     /// Compile supported JSON-schema assertions strictly; external references and
     /// compiler option extensions are rejected before compilation.
     pub fn compile_json_schema(&self, schema: &Value) -> Result<RequestGrammar> {
@@ -389,7 +422,8 @@ impl GrammarCompiler {
             ));
         }
         let mut request = RequestGrammar {
-            matcher,
+            matcher: Some(matcher),
+            forbidden: Vec::new(),
             mask: vec![0; self.model_vocab.div_ceil(32)],
             tokenizer_vocab: self.tokenizer_vocab,
             eos_ids: self.eos_ids.clone(),
@@ -445,10 +479,11 @@ impl TextGrammar {
     }
 }
 
-/// Per-generation parser. Advance once per sampled completion before uploading
+/// Per-generation parser or static sampling mask. Advance once per sampled completion before uploading
 /// the following mask; prompt tokens and consumed pending tokens do not advance it.
 pub struct RequestGrammar {
-    matcher: Matcher,
+    matcher: Option<Matcher>,
+    forbidden: Vec<u32>,
     mask: Vec<i32>,
     tokenizer_vocab: usize,
     eos_ids: Arc<[u32]>,
@@ -458,6 +493,10 @@ pub struct RequestGrammar {
 }
 
 impl RequestGrammar {
+    pub(crate) fn is_structured(&self) -> bool {
+        self.matcher.is_some()
+    }
+
     /// Returns masks before each legal non-EOS draft and after the final draft.
     /// The committed parser, including its lexer caches, remains independent.
     pub fn copy_masks(&self, tokens: &[u32]) -> Result<(usize, Vec<i32>)> {
@@ -477,7 +516,8 @@ impl RequestGrammar {
             ));
         }
         let mut tentative = Self {
-            matcher: self.matcher.deep_clone(),
+            matcher: self.matcher.as_ref().map(Matcher::deep_clone),
+            forbidden: self.forbidden.clone(),
             mask: self.mask.clone(),
             tokenizer_vocab: self.tokenizer_vocab,
             eos_ids: self.eos_ids.clone(),
@@ -497,11 +537,13 @@ impl RequestGrammar {
             {
                 break;
             }
-            if let Err(error) = tentative.matcher.consume_token(token) {
-                return Err(Error::Admission(AdmissionError::Grammar(Failure::boxed(
-                    format!("grammar advancement failed: {error:#}"),
-                    error.into_boxed_dyn_error(),
-                ))));
+            if let Some(matcher) = &mut tentative.matcher {
+                if let Err(error) = matcher.consume_token(token) {
+                    return Err(Error::Admission(AdmissionError::Grammar(Failure::boxed(
+                        format!("grammar advancement failed: {error:#}"),
+                        error.into_boxed_dyn_error(),
+                    ))));
+                }
             }
             if !tentative.refresh_mask_available()? {
                 break;
@@ -544,6 +586,9 @@ impl RequestGrammar {
                 format!("token {token} is forbidden by the grammar mask"),
             ));
         }
+        if self.matcher.is_none() {
+            return Ok(());
+        }
         if self.eos_ids.contains(&token) {
             if !self.accepting {
                 return self.fail(Error::admission(
@@ -555,11 +600,13 @@ impl RequestGrammar {
             self.mask.fill(0);
             return Ok(());
         }
-        if let Err(error) = self.matcher.consume_token(token) {
-            return self.fail(Error::Admission(AdmissionError::Grammar(Failure::boxed(
-                format!("grammar advancement failed: {error:#}"),
-                error.into_boxed_dyn_error(),
-            ))));
+        if let Some(matcher) = &mut self.matcher {
+            if let Err(error) = matcher.consume_token(token) {
+                return self.fail(Error::Admission(AdmissionError::Grammar(Failure::boxed(
+                    format!("grammar advancement failed: {error:#}"),
+                    error.into_boxed_dyn_error(),
+                ))));
+            }
         }
         self.refresh_mask()
     }
@@ -576,13 +623,16 @@ impl RequestGrammar {
 
     fn refresh_mask_available(&mut self) -> Result<bool> {
         self.mask.fill(0);
-        if !self.matcher.stop_reason().is_ok() {
-            return self.fail(Error::admission(
-                AdmissionError::Grammar,
-                format!("grammar stopped with {:?}", self.matcher.stop_reason()),
-            ));
+        let Some(matcher) = &mut self.matcher else {
+            self.mask[..self.tokenizer_vocab.div_ceil(32)].fill(-1);
+            self.restrict_mask();
+            return Ok(self.mask.iter().any(|&word| word != 0));
+        };
+        if !matcher.stop_reason().is_ok() {
+            let message = format!("grammar stopped with {:?}", matcher.stop_reason());
+            return self.fail(Error::admission(AdmissionError::Grammar, message));
         }
-        self.accepting = match self.matcher.is_accepting() {
+        self.accepting = match matcher.is_accepting() {
             Ok(value) => value,
             Err(error) => {
                 return self.fail(Error::Admission(AdmissionError::Grammar(Failure::boxed(
@@ -591,7 +641,7 @@ impl RequestGrammar {
                 ))));
             }
         };
-        let allowed = match self.matcher.compute_mask_or_eos() {
+        let allowed = match matcher.compute_mask_or_eos() {
             Ok(mask) => mask,
             Err(error) => {
                 return self.fail(Error::Admission(AdmissionError::Grammar(Failure::boxed(
@@ -603,11 +653,18 @@ impl RequestGrammar {
         for (destination, &word) in self.mask.iter_mut().zip(allowed.as_slice()) {
             *destination = word as i32;
         }
+        self.restrict_mask();
+        Ok(self.mask.iter().any(|&word| word != 0))
+    }
+
+    fn restrict_mask(&mut self) {
+        for &token in &self.forbidden {
+            self.mask[token as usize / 32] &= !(1_u32 << (token % 32)) as i32;
+        }
         let tail = self.tokenizer_vocab % 32;
         if tail != 0 {
             self.mask[self.tokenizer_vocab / 32] &= ((1_u32 << tail) - 1) as i32;
         }
-        Ok(self.mask.iter().any(|&word| word != 0))
     }
 
     fn fail<T>(&mut self, error: Error) -> Result<T> {
@@ -745,6 +802,51 @@ mod tests {
             }
         }
         request.advance(eos).is_ok()
+    }
+
+    #[test]
+    fn static_token_exclusions_survive_tokens_eos_and_speculative_proposals() {
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let mut mask = compiler.exclude_tokens(None, &[31, 65, 31]).unwrap();
+        assert!(!mask.is_structured());
+        assert!(!allowed(&mask, 31) && !allowed(&mask, 65));
+        assert!(allowed(&mask, 256) && allowed(&mask, 257));
+        assert!((258..320).all(|token| !allowed(&mask, token)));
+        let initial = mask.mask().to_vec();
+        for token in [0, 32, 256, 257, 255] {
+            mask.advance(token).unwrap();
+            assert_eq!(mask.mask(), initial);
+            assert!(!mask.is_stopped());
+        }
+        let (legal, proposals) = mask.copy_masks(&[1, 2, 31, 3]).unwrap();
+        assert_eq!(legal, 2);
+        assert_eq!(proposals, initial.repeat(3));
+        assert_eq!(mask.mask(), initial);
+        assert!(mask.advance(31).is_err());
+        assert!(mask.mask().iter().all(|&word| word == 0));
+        assert!(compiler.exclude_tokens(None, &[]).is_err());
+        assert!(compiler.exclude_tokens(None, &[256]).is_err());
+        assert!(compiler.exclude_tokens(None, &[258]).is_err());
+    }
+
+    #[test]
+    fn token_exclusions_intersect_each_structured_mask() {
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let grammar = compiler.compile_lark("start: /[ab]+/").unwrap();
+        let mut grammar = compiler.exclude_tokens(Some(grammar), &[b'b' as u32]).unwrap();
+        assert!(grammar.is_structured());
+        for _ in 0..3 {
+            assert!(allowed(&grammar, b'a' as u32));
+            assert!(!allowed(&grammar, b'b' as u32));
+            grammar.advance(b'a' as u32).unwrap();
+        }
+        let (legal, masks) = grammar.copy_masks(&[b'a' as u32, b'b' as u32]).unwrap();
+        assert_eq!(legal, 1);
+        for mask in masks.chunks_exact(grammar.mask().len()) {
+            assert_eq!(mask[b'b' as usize / 32] as u32 & (1 << (b'b' % 32)), 0);
+        }
+        grammar.advance(256).unwrap();
+        assert!(grammar.is_stopped());
     }
 
     #[test]

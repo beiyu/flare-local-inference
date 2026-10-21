@@ -117,3 +117,49 @@ def test_nucleus_distributions_match_sorted_probability_reference(temperature):
     torch.testing.assert_close(operation.probabilities, expected.float(), rtol=2e-5, atol=1e-8)
     assert state.parameters[0, 1].item() == pytest.approx(.95)
     graph.reset()
+
+
+@torch.no_grad()
+def test_zero_temperature_conditional_distributions_are_lowest_id_argmax_with_penalties():
+    from ignition.components.sampling import DeviceRequestState, RequestAdmission
+    from ignition.components.speculation import PreparedSpeculativeDistributions
+    from ignition.preparation.compilation import compile_forward
+
+    vocab = 1024
+    logits = torch.full((1, 4, vocab), -torch.inf, device="cuda")
+    logits[:, :, 3] = 5.
+    logits[:, :, 4] = 5.
+    state = DeviceRequestState.allocate("cuda", vocab_size=vocab)
+    state.admit(0, RequestAdmission(generation=1, seed=17, temperature=0.,
+        top_k=1, top_p=.01, min_p=1., repetition_penalty=2., frequency_penalty=1., eos_token_ids=()), [])
+    slots = torch.tensor([0], device="cuda", dtype=torch.int32)
+    epochs = torch.tensor([1], device="cuda", dtype=torch.int64)
+    live = torch.tensor([1], device="cuda", dtype=torch.int32)
+    candidates = torch.tensor([[3, 4, 3]], device="cuda", dtype=torch.int64)
+    operation = PreparedSpeculativeDistributions(logits, state, slots, epochs, live, candidates)
+    operation.prepare()
+    compiled = compile_forward(operation)
+    compiled()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    bundle = PreparedGraphBundle(device=0, graphs={"conditional":graph},
+        buffers=dict(logits=logits, probabilities=operation.probabilities, valid=operation.valid),
+        resources=(operation, compiled, state, slots, epochs, live, candidates))
+    worker = bundle.start_worker()
+    try:
+        for _ in range(3):
+            before = torch.cuda.memory_stats()
+            ticket = worker.submit(0)
+            result = worker.poll(timeout_ms=120000)
+            assert result is not None and result.ticket == ticket and result.error is None
+            after = torch.cuda.memory_stats()
+            for counter in ("allocation.all.allocated", "allocation.all.freed", "segment.all.allocated", "segment.all.freed"):
+                assert before[counter] == after[counter]
+            assert operation.valid.all()
+            assert operation.probabilities.argmax(-1).tolist() == [[3, 4, 3, 4]]
+            assert operation.probabilities.count_nonzero(-1).tolist() == [[1, 1, 1, 1]]
+            assert operation.probabilities.sum(-1).tolist() == [[1., 1., 1., 1.]]
+    finally:
+        worker.close()
+        graph.reset()

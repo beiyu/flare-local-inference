@@ -1,0 +1,16 @@
+# Preparation tools for the existing two-Spark deployment. Serving uses native Flare.
+ARG BASE_IMAGE=local/glm53-exl3:runtime-20260928
+FROM ${BASE_IMAGE}
+RUN printf '%s\n' \
+      'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports noble main universe multiverse restricted' \
+      'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports noble-updates main universe multiverse restricted' \
+      'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports noble-security main universe multiverse restricted' \
+      > /tmp/flare-sources.list \
+    && apt-get -o Dir::Etc::sourcelist=/tmp/flare-sources.list -o Dir::Etc::sourceparts=- update \
+    && apt-get -o Dir::Etc::sourcelist=/tmp/flare-sources.list -o Dir::Etc::sourceparts=- install -y --no-install-recommends \
+       git protobuf-compiler libssl-dev liburing-dev libibverbs-dev rdma-core pkg-config cmake python3-dev \
+    && rm -rf /var/lib/apt/lists/* /tmp/flare-sources.list
+WORKDIR /work
+ENV CARGO_HOME=/runtime/tools/cargo RUSTUP_HOME=/runtime/tools/rustup
+ENTRYPOINT ["sleep"]
+CMD ["infinity"]
