@@ -12,6 +12,8 @@
 [ ] Measure complete two-Spark GLM serving performance against the original
     deployment with equivalent workloads, concurrency and cache state; single
     request timings are not a throughput or latency comparison.
+    Diagnostic draft/scheduler and component trials are recorded in
+    glm53-performance-20261022.md; output qualification remains open.
 
 [ ] Exercise per-message checkpoint restore and prefill graph selection through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
