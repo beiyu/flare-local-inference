@@ -54,6 +54,35 @@ def test_header_inspection_never_reads_payload(tmp_path, monkeypatch):
     assert tensors["weight"].nbytes == 4
 
 
+
+@pytest.mark.parametrize("dtype,item_bytes", [("F16", 2), ("I16", 2), ("I32", 4)])
+def test_exl3_storage_dtypes_are_inspected_without_conversion(tmp_path, dtype, item_bytes):
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+
+    # EXL3 stores FP16 signs/scales, packed INT16 trellises and an INT32 marker.
+    # The preflight must retain those exact types and validate their byte ranges.
+    payload = bytes(range(3 * item_bytes))
+    path = tmp_path / "model.safetensors"
+    data_start = _write_header(path, {"packed": {
+        "dtype": dtype, "shape": [3], "data_offsets": [0, len(payload)],
+    }}, payload)
+    checkpoint = inspect_indexed_checkpoint(tmp_path)
+    tensor = checkpoint.tensors["packed"]
+    assert (tensor.dtype, tensor.shape, tensor.offset, tensor.nbytes) == (
+        dtype, (3,), data_start, len(payload))
+    assert path.read_bytes()[tensor.offset:tensor.offset + tensor.nbytes] == payload
+
+
+@pytest.mark.parametrize("dtype,item_bytes", [("F16", 2), ("I16", 2), ("I32", 4)])
+def test_exl3_storage_dtypes_reject_inconsistent_element_widths(tmp_path, dtype, item_bytes):
+    path = tmp_path / "bad.safetensors"
+    _write_header(path, {"packed": {
+        "dtype": dtype, "shape": [3], "data_offsets": [0, 3 * item_bytes - 1],
+    }}, bytes(3 * item_bytes - 1))
+    with pytest.raises(CheckpointError, match="packed"):
+        _read_header(path, path.name)
+
+
 def test_single_safetensors_checkpoint_without_index(tmp_path):
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 

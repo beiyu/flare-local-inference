@@ -422,6 +422,26 @@ Kimi K3 always uses thinking: its template ignores `enable_thinking=false` and
 accepts `low`, `high`, or `max` effort (default `max`).
 The generation output limit includes reasoning and tool syntax.
 
+String stops (`stop`, or Anthropic `stop_sequences`) normally match the complete
+raw decoded output, including reasoning and tool envelopes. The native request
+extension `stop_scope: "after_reasoning"` defers matching until the initial
+reasoning envelope ends when the rendered prompt starts generation in reasoning.
+The reasoning close delimiter is excluded from matching; an implicit terminal
+such as a tool-call opener starts the eligible output. Split delimiters and
+reasoning/answer boundaries within one token are handled incrementally. Later
+reasoning envelopes do not rearm this initial guard. Nonthinking conversations
+and raw Completions retain ordinary matching. Applying this option to string
+stops during initial token-delimited XTML reasoning returns HTTP 400: literal
+marker text and actual control tokens have different semantics, so a decoded-string
+guard is unsupported.
+
+Omitting `stop_scope`, setting it to null, or selecting `"all"` retains the
+default behavior for every model package. Other values are rejected. The option
+is accepted by all four inference APIs; callers must set it on each request,
+because there is no server-wide default. It changes only string-stop matching:
+EOS, output limits, cancellation, token-stop rules, and the incompatibility of
+string stops with token stops or structured output remain unchanged.
+
 Anthropic thinking blocks carry a deterministic `flare-thinking-v1:` marker
 derived from their visible text. Replayed local markers are checked for matching
 text. This marker is a local round-trip consistency check, not provider

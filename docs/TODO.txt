@@ -1,3 +1,13 @@
+[ ] Run qualify/exl3_package on an available SM121 GPU, then integrate the original
+    EXL3 experts and BF16 KDA/MLA projections into GLM without requantization.
+
+[ ] Apply the existing BF16 o_proj donor before GLM preparation; preserve its
+    template, tool_choice:none, sampling, output defaults and cache identity.
+
+[ ] Integrate the GLM image encoder/projector and prefill feature injection before
+    enabling its image frontend in glm53 exports; qualify BF16 vision, native
+    replay, 20-image windows and cache restore against the current processor.
+
 [ ] Exercise per-message checkpoint restore and prefill graph selection through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.
@@ -78,3 +88,6 @@
     proposal/verification transitions. Use per-fence scheduler traces and request
     latency measurements; measure GPU replay, queueing, and host planning separately.
     See scheduling-runtime-design.md#funded-timing-refresh.
+
+[ ] Add an explicit server/CLI default for string stop_scope with per-request
+    overrides; deployments currently set after_reasoning on each request.

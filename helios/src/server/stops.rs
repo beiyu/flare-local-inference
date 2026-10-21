@@ -79,10 +79,25 @@ pub(super) fn validate_strings(strings: &[String], token_stops: bool, grammar: b
     Ok(())
 }
 
+pub(super) fn validate_initial_reasoning(
+    syntax: Option<&crate::model::contract::ReasoningParser>,
+) -> Result<()> {
+    if syntax.is_some_and(|syntax| {
+        syntax.kind != crate::model::contract::ReasoningParserKind::ThinkTags
+    }) {
+        return Err(Error::admission(
+            AdmissionError::Feature,
+            "after_reasoning string stops require text-delimited reasoning; token-delimited reasoning is unsupported",
+        ));
+    }
+    Ok(())
+}
+
 struct StringStops {
     strings: Vec<String>,
     held: String,
     matched: Option<String>,
+    initial_reasoning: Option<crate::model::contract::ReasoningParser>,
 }
 impl StringStops {
     fn new(strings: Vec<String>) -> Result<Self> {
@@ -91,6 +106,7 @@ impl StringStops {
             strings,
             held: String::new(),
             matched: None,
+            initial_reasoning: None,
         })
     }
     fn push(&mut self, text: &str) -> (String, bool) {
@@ -98,6 +114,42 @@ impl StringStops {
             return (String::new(), true);
         }
         self.held.push_str(text);
+        let mut reasoning_prefix = String::new();
+        if let Some(syntax) = &self.initial_reasoning {
+            // A close delimiter belongs to reasoning; an implicit terminal starts
+            // the following envelope and must remain eligible for a user stop.
+            let markers = std::iter::once((syntax.close.as_str(), true)).chain(
+                syntax
+                    .terminal_markers
+                    .iter()
+                    .map(|marker| (marker.as_str(), false)),
+            );
+            let boundary = markers
+                .clone()
+                .filter_map(|(marker, consume)| {
+                    self.held
+                        .find(marker)
+                        .map(|at| (at, if consume { marker.len() } else { 0 }))
+                })
+                .min_by_key(|(at, _)| *at);
+            if let Some((at, consume)) = boundary {
+                reasoning_prefix = self.held.drain(..at + consume).collect();
+                self.initial_reasoning = None;
+            } else {
+                let retain = markers
+                    .flat_map(|(marker, _)| {
+                        marker
+                            .char_indices()
+                            .skip(1)
+                            .map(|(length, _)| length)
+                            .filter(|length| self.held.ends_with(&marker[..*length]))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let visible = self.held.len() - retain;
+                return (self.held.drain(..visible).collect(), false);
+            }
+        }
         if let Some((_, at, matched)) = self
             .strings
             .iter()
@@ -108,6 +160,11 @@ impl StringStops {
             let visible = self.held[..at].to_owned();
             self.held.clear();
             self.matched = Some(self.strings[matched].clone());
+            let visible = if reasoning_prefix.is_empty() {
+                visible
+            } else {
+                reasoning_prefix + &visible
+            };
             return (visible, true);
         }
         let retain = self
@@ -121,7 +178,13 @@ impl StringStops {
             })
             .max()
             .unwrap_or(0);
-        (self.held.drain(..self.held.len() - retain).collect(), false)
+        let visible: String = self.held.drain(..self.held.len() - retain).collect();
+        let visible = if reasoning_prefix.is_empty() {
+            visible
+        } else {
+            reasoning_prefix + &visible
+        };
+        (visible, false)
     }
     fn finish(&mut self) -> String {
         std::mem::take(&mut self.held)
@@ -157,6 +220,14 @@ impl<'a> TextStops<'a> {
             spans: std::collections::VecDeque::new(),
             visible_bytes: 0,
         })
+    }
+    pub fn with_initial_reasoning(
+        mut self,
+        syntax: Option<&crate::model::contract::ReasoningParser>,
+    ) -> Result<Self> {
+        validate_initial_reasoning(syntax)?;
+        self.stops.initial_reasoning = syntax.cloned();
+        Ok(self)
     }
     pub fn track(&mut self, frontend: &'a crate::frontend::Frontend) {
         self.tracked = Some(super::token_spans::TokenSpans::new(frontend));
@@ -360,6 +431,428 @@ pub(super) mod string_tests {
         .unwrap();
         std::fs::remove_dir_all(root).unwrap();
         result
+    }
+
+    fn reasoning(
+        close: &str,
+        terminal_markers: &[&str],
+    ) -> crate::model::contract::ReasoningParser {
+        let xtml = close == "<|close|>think<|sep|>";
+        crate::model::contract::ReasoningParser {
+            kind: if xtml {
+                crate::model::contract::ReasoningParserKind::XtmlThink
+            } else {
+                crate::model::contract::ReasoningParserKind::ThinkTags
+            },
+            open: if xtml {
+                "<|open|>think<|sep|>"
+            } else {
+                "<think>"
+            }
+            .into(),
+            close: close.into(),
+            wrapping_newlines: 0,
+            terminal_markers: terminal_markers.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    fn xtml_frontend() -> Frontend {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "flare-stop-xtml-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut alphabet: Vec<_> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+            .into_iter()
+            .collect();
+        alphabet.sort_unstable();
+        let vocabulary: tokenizers::models::bpe::Vocab = alphabet
+            .into_iter()
+            .enumerate()
+            .map(|(id, character)| (character.to_string(), id as u32))
+            .collect();
+        let mut tokenizer = tokenizers::Tokenizer::new(
+            tokenizers::models::bpe::BPE::builder()
+                .vocab_and_merges(vocabulary, vec![])
+                .build()
+                .unwrap(),
+        );
+        tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        tokenizer
+            .add_special_tokens(
+                ["<|open|>", "<|close|>", "<|sep|>", "<eos>"]
+                    .map(|marker| tokenizers::AddedToken::from(marker, true)),
+            )
+            .unwrap();
+        let asset = |name: &str, bytes: &[u8]| {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            Asset {
+                path,
+                range: None,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }
+        };
+        let frontend = Frontend::load(FrontendAssets {
+            tokenizer: asset("tokenizer.json", tokenizer.to_string(false).unwrap().as_bytes()),
+            tokens: Default::default(),
+            chat_template: Some(asset("chat.jinja", b"{% for message in messages %}{{ message.content }}{% endfor %}<|assistant|><|open|>think<|sep|>")),
+        }, serde_json::json!({"add_generation_prompt":true}).as_object().unwrap().clone()).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        frontend
+    }
+
+    fn xtml_output(frontend: &Frontend) -> crate::output::OutputConfig {
+        use crate::model::contract::{ToolParser, ToolParserKind};
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.assistant_marker = "<|assistant|>".into();
+        syntax.reasoning = Some(reasoning("<|close|>think<|sep|>", &[]));
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::Xtml,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        crate::output::OutputConfig {
+            syntax,
+            content: crate::output::tagged::OutputConfig {
+                structured: false,
+                start: crate::output::tagged::OutputStart::Reasoning,
+                tools: vec![],
+            },
+            control_tokens: ["<|open|>", "<|close|>", "<|sep|>"]
+                .into_iter()
+                .map(|marker| {
+                    let ids = frontend.encode(marker, false).unwrap();
+                    assert_eq!(ids.len(), 1);
+                    (ids[0], marker.into())
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn xtml_literal_close_and_real_control_close_keep_distinct_parser_semantics() {
+        use crate::output::{OutputPipeline, Termination};
+        use crate::server::output::{Accumulator, Decoder};
+        let frontend = xtml_frontend();
+        let config = xtml_output(&frontend);
+        let literal = "<|close|>think<|sep|>STOP";
+        let ordinary: Vec<u32> = literal
+            .chars()
+            .map(|character| {
+                frontend
+                    .tokenizer()
+                    .token_to_id(&character.to_string())
+                    .unwrap()
+            })
+            .collect();
+        let controls = frontend
+            .encode(
+                "reason<|close|>think<|sep|><|open|>response<|sep|>answer",
+                false,
+            )
+            .unwrap();
+        for (tokens, expected_reason, expected_answer) in [
+            (ordinary.clone(), Some(literal), None),
+            (controls, Some("reason"), Some("answer")),
+        ] {
+            let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config.clone()));
+            let mut output = Accumulator::new("xtml".into());
+            for token in tokens {
+                output.apply(decoder.push(token).unwrap()).unwrap();
+            }
+            output
+                .apply(decoder.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            assert_eq!(
+                output.message()["reasoning_content"].as_str(),
+                expected_reason
+            );
+            assert_eq!(output.message()["content"].as_str(), expected_answer);
+        }
+        let syntax = config.syntax.reasoning.as_ref().unwrap();
+        assert!(matches!(
+            TextStops::new(&frontend, vec!["STOP".into()])
+                .unwrap()
+                .with_initial_reasoning(Some(syntax))
+                .err()
+                .unwrap(),
+            Error::Admission(AdmissionError::Feature(_)),
+        ));
+        let mut legacy = TextStops::new(&frontend, vec!["STOP".into()]).unwrap();
+        let mut visible = String::new();
+        let mut matched = false;
+        for token in ordinary {
+            let (pieces, hit) = legacy.push(token).unwrap();
+            visible.push_str(&text(pieces));
+            matched |= hit;
+        }
+        assert!(matched);
+        assert_eq!(visible, "<|close|>think<|sep|>");
+    }
+
+    #[test]
+    fn initial_xtml_after_reasoning_scope_is_rejected_before_request_admission() {
+        let frontend = xtml_frontend();
+        let output = xtml_output(&frontend);
+        let mut config =
+            crate::frontend::test_support::model_config(crate::model::testing::metadata());
+        config.contract.frontend = output.syntax;
+        config.contract.vocabulary = frontend.tokenizer().get_vocab_size(true);
+        config.contract.input_vocabulary = config.contract.vocabulary;
+        config.eos_token_ids = vec![frontend.tokenizer().token_to_id("<eos>").unwrap()];
+        let compiler = crate::grammar::GrammarCompiler::new(
+            frontend.tokenizer(),
+            config.contract.vocabulary,
+            &config.eos_token_ids,
+        )
+        .unwrap();
+        for scope in [None, Some("all"), Some("after_reasoning")] {
+            let mut body = serde_json::json!({
+                "model":config.model_id, "messages":[{"role":"user","content":"hello"}],
+                "stop":"STOP", "max_tokens":8,
+            });
+            if let Some(scope) = scope {
+                body["stop_scope"] = scope.into();
+            }
+            let prepared =
+                crate::server::request::prepare(&frontend, None, &compiler, &config, body);
+            if scope == Some("after_reasoning") {
+                assert!(matches!(
+                    prepared.err().unwrap(),
+                    Error::Admission(AdmissionError::Feature(_))
+                ));
+            } else {
+                let prepared = prepared.unwrap();
+                assert_eq!(
+                    prepared.output.content.start,
+                    crate::output::tagged::OutputStart::Reasoning
+                );
+                assert!(prepared.prompt.string_stop_reasoning.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn initial_reasoning_stops_are_independent_of_marker_and_stop_chunk_boundaries() {
+        let input = "<think>Question: STOP</think>answerSTOPdiscard";
+        for first in 0..=input.len() {
+            for second in first..=input.len() {
+                let mut stops =
+                    StringStops::new(vec!["Question:".into(), "STOP".into(), "</th".into()])
+                        .unwrap();
+                stops.initial_reasoning = Some(reasoning("</think>", &[]));
+                let mut visible = String::new();
+                let mut matched = false;
+                for chunk in [&input[..first], &input[first..second], &input[second..]] {
+                    let (text, hit) = stops.push(chunk);
+                    visible.push_str(&text);
+                    matched |= hit;
+                }
+                assert!(matched, "splits {first}/{second}");
+                assert_eq!(
+                    visible, "<think>Question: STOP</think>answer",
+                    "splits {first}/{second}"
+                );
+                assert_eq!(stops.matched.as_deref(), Some("STOP"));
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_guard_uses_declared_close_and_tool_terminal_without_matching_across_them() {
+        let mut stops = StringStops::new(vec!["STOP".into()]).unwrap();
+        stops.initial_reasoning = Some(reasoning("</think>", &[]));
+        assert_eq!(stops.push("ST</thi"), ("ST".into(), false));
+        assert_eq!(stops.push("nk>OP"), ("</think>OP".into(), false));
+        assert_eq!(stops.push("<think>STOP"), ("<think>".into(), true));
+
+        let mut stops = StringStops::new(vec!["STOP".into(), "<tool_call>".into()]).unwrap();
+        stops.initial_reasoning = Some(reasoning("</think>", &["<tool_call>"]));
+        assert_eq!(stops.push("STOP<tool_"), ("STOP".into(), false));
+        assert_eq!(stops.push("call>discard"), (String::new(), true));
+        assert_eq!(stops.matched.as_deref(), Some("<tool_call>"));
+    }
+
+    #[test]
+    fn decoder_clips_answer_inside_the_same_token_that_closes_reasoning() {
+        use crate::output::Piece;
+        let frontend = crate::server::output::tests::frontend(&["STOP</think>answerSTOPdiscard"]);
+        let syntax = reasoning("</think>", &[]);
+        let mut stops = TextStops::new(&frontend, vec!["STOP".into()])
+            .unwrap()
+            .with_initial_reasoning(Some(&syntax))
+            .unwrap();
+        assert_eq!(
+            stops.push(0).unwrap(),
+            (vec![Piece::Text("STOP</think>answer".into())], true)
+        );
+        assert_eq!(stops.finish(Some(99)).unwrap(), (vec![], true));
+        let mut all = TextStops::new(&frontend, vec!["STOP".into()]).unwrap();
+        assert_eq!(all.push(0).unwrap(), (vec![], true));
+    }
+
+    #[test]
+    fn ordinary_scope_keeps_stops_inside_fragmented_reasoning_markup() {
+        let frontend =
+            crate::server::output::tests::frontend(&["<thi", "nk>reasonST", "OP</think>answer"]);
+        let mut stops = TextStops::new(&frontend, vec!["STOP".into()]).unwrap();
+        let mut visible = String::new();
+        for token in [0, 1, 2] {
+            let (text, matched) = push_text(&mut stops, token);
+            visible.push_str(&text);
+            assert_eq!(matched, token == 2);
+        }
+        assert_eq!(visible, "<think>reason");
+        assert_eq!(finish_text(&mut stops), (String::new(), true));
+    }
+
+    #[test]
+    fn reasoning_guard_preserves_utf8_and_flushes_unclosed_reasoning_at_normal_termination() {
+        let frontend = frontend();
+        let syntax = reasoning("</think>", &[]);
+        let mut stops = TextStops::new(&frontend, vec!["世界".into()])
+            .unwrap()
+            .with_initial_reasoning(Some(&syntax))
+            .unwrap();
+        let mut visible = String::new();
+        for token in [2, 3, 4, 5, 6, 7] {
+            let (text, matched) = push_text(&mut stops, token);
+            visible.push_str(&text);
+            assert!(!matched);
+        }
+        assert_eq!(visible, "世界");
+        assert_eq!(finish_text(&mut stops), (String::new(), false));
+
+        let frontend = crate::server::output::tests::frontend(&["STOP</thi"]);
+        for eos in [None, Some(99)] {
+            let mut stops = TextStops::new(&frontend, vec!["STOP".into(), "</th".into()])
+                .unwrap()
+                .with_initial_reasoning(Some(&syntax))
+                .unwrap();
+            let (mut pieces, matched) = stops.push(0).unwrap();
+            assert!(!matched);
+            let (tail, matched) = stops.finish(eos).unwrap();
+            assert!(!matched);
+            pieces.extend(tail);
+            assert_eq!(text(pieces), "STOP</thi");
+        }
+    }
+
+    #[test]
+    fn reasoning_guard_and_output_pipeline_keep_reasoning_and_answer_separate() {
+        use crate::output::{
+            Input, OutputConfig, OutputPipeline, Piece, Termination,
+            tagged::{OutputConfig as TaggedConfig, OutputStart},
+        };
+        use crate::server::output::Accumulator;
+        let pieces = ["Question:ST", "OP</thi", "nk>answerST", "OPdiscard"];
+        let frontend = crate::server::output::tests::frontend(&pieces);
+        let syntax = reasoning("</think>", &[]);
+        for cause in [
+            Termination::UserStop,
+            Termination::Eos,
+            Termination::OutputLimit,
+        ] {
+            let mut contract = crate::model::testing::metadata().frontend;
+            contract.reasoning = Some(syntax.clone());
+            let mut parser = OutputPipeline::new(OutputConfig {
+                syntax: contract,
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    start: OutputStart::Reasoning,
+                    structured: false,
+                    tools: vec![],
+                },
+            });
+            let mut stops = TextStops::new(&frontend, vec!["Question:".into(), "STOP".into()])
+                .unwrap()
+                .with_initial_reasoning(Some(&syntax))
+                .unwrap();
+            let mut output = Accumulator::new("guard".into());
+            let mut last_match = false;
+            for token in 0..if cause == Termination::UserStop { 4 } else { 3 } {
+                let (pieces, matched) = stops.push(token).unwrap();
+                last_match = matched;
+                for piece in pieces {
+                    let events = match piece {
+                        Piece::Token(token) => parser.push(Input::Token(token)).unwrap(),
+                        Piece::Text(text) => parser.push(Input::Text(&text)).unwrap(),
+                        Piece::Logprob(_) => unreachable!(),
+                    };
+                    output.apply(events).unwrap();
+                }
+            }
+            assert_eq!(last_match, cause == Termination::UserStop);
+            let (tail, matched) = stops.finish(None).unwrap();
+            assert_eq!(matched, cause == Termination::UserStop);
+            for piece in tail {
+                if let Piece::Text(text) = piece {
+                    output
+                        .apply(parser.push(Input::Text(&text)).unwrap())
+                        .unwrap();
+                }
+            }
+            output.apply(parser.finish(cause).unwrap()).unwrap();
+            output.finish().unwrap();
+            assert_eq!(output.message()["reasoning_content"], "Question:STOP");
+            assert_eq!(
+                output.message()["content"],
+                if cause == Termination::UserStop {
+                    "answer"
+                } else {
+                    "answerST"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_or_failing_does_not_flush_a_pending_reasoning_close_marker() {
+        use crate::output::{
+            Input, OutputConfig, OutputPipeline, Piece, Termination,
+            tagged::{OutputConfig as TaggedConfig, OutputStart},
+        };
+        use crate::server::output::Accumulator;
+        let frontend = crate::server::output::tests::frontend(&["reasonSTOP", "</thi"]);
+        let syntax = reasoning("</think>", &[]);
+        for cause in [Termination::Cancelled, Termination::ExecutionError] {
+            let mut contract = crate::model::testing::metadata().frontend;
+            contract.reasoning = Some(syntax.clone());
+            let mut parser = OutputPipeline::new(OutputConfig {
+                syntax: contract,
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    start: OutputStart::Reasoning,
+                    structured: false,
+                    tools: vec![],
+                },
+            });
+            let mut output = Accumulator::new("cancel".into());
+            let mut stops = TextStops::new(&frontend, vec!["STOP".into()])
+                .unwrap()
+                .with_initial_reasoning(Some(&syntax))
+                .unwrap();
+            for token in [0, 1] {
+                let (pieces, matched) = stops.push(token).unwrap();
+                assert!(!matched);
+                for piece in pieces {
+                    if let Piece::Text(text) = piece {
+                        output
+                            .apply(parser.push(Input::Text(&text)).unwrap())
+                            .unwrap();
+                    }
+                }
+            }
+            assert_eq!(output.message()["reasoning_content"], "reasonSTOP");
+            // Cancellation drops the worker's filter without the EOS/length flush.
+            drop(stops);
+            assert!(parser.finish(cause).unwrap().is_empty());
+            assert!(!output.message().to_string().contains("</thi"));
+        }
     }
 
     #[test]

@@ -261,3 +261,55 @@ def test_native_image_token_validation(tmp_path, monkeypatch, token_id, encoded,
     monkeypatch.setattr(tokenizers, "Tokenizer", Tokenizer)
     with pytest.raises(ValueError, match="image"):
         _native_image_placeholder(tmp_path, {"image_token_id": configured}, PromptEncoder.DEEPSEEK_V41)
+
+
+def glm_image_source():
+    image = dict(image_processor_type="Glm5NextImageProcessor", patch_size=14, temporal_patch_size=2,
+        merge_size=2, image_mean=[0.48145466, 0.4578275, 0.40821073],
+        image_std=[0.26862954, 0.26130258, 0.27577711], min_image_tokens=16,
+        max_image_tokens=2048, patch_expand_factor=1)
+    processor = dict(processor_class="Glm5NextProcessor", image_processor=image,
+        video_processor={"unused": True})
+    model = dict(model_type="glm5_next", image_token_id=154854, image_start_token_id=154830,
+        image_end_token_id=154831, vision_config=dict(patch_size=14, temporal_patch_size=2,
+            spatial_merge_size=2, in_channels=3))
+    return processor, model
+
+
+def test_glm_inline_processor_settings_survive_typed_publication(tmp_path):
+    processor, model = glm_image_source()
+    (tmp_path / "tokenizer_config.json").write_text('{"eos_token":"<eos>"}')
+    (tmp_path / "processor_config.json").write_text(json.dumps(processor))
+    (tmp_path / "config.json").write_text(json.dumps(model))
+    settings = prepare_frontend(tmp_path, eos_token_ids=[154820, 154827, 154829], image_profile="glm")
+    assert settings["image"] == {"glm": dict(min_image_tokens=16, max_image_tokens=2048, patch_expand_factor=1)}
+    source = server()
+    source["frontend"] = settings
+    index = ModelIndex(version=4, ranks=[BundleIndex()])
+    serving(index, source)
+    restored = ModelIndex.FromString(index.SerializeToString())
+    assert restored.frontend.image.WhichOneof("profile") == "glm"
+    assert restored.frontend.image.glm.max_image_tokens == 2048
+    assert not restored.contract.HasField("model_contract")  # Frontend metadata does not enable vision execution.
+
+
+@pytest.mark.parametrize("key,value", [("patch_size", 16), ("temporal_patch_size", 1),
+    ("resize_mode", "resize"), ("do_normalize", False), ("min_image_tokens", 0),
+    ("max_image_tokens", 15), ("patch_expand_factor", 0), ("max_image_tokens", True)])
+def test_glm_processor_rejects_unsupported_or_invalid_semantics(key, value):
+    processor, model = glm_image_source()
+    processor["image_processor"][key] = value
+    with pytest.raises(ValueError, match="GLM"):
+        image_settings(processor, model, "glm")
+
+
+def test_legacy_image_metadata_wire_fields_are_unchanged():
+    # Serialized ImageSettings(mimo={min_pixels:3136,max_pixels:12845056}) before GLM was added.
+    from ignition.preparation.runtime_package_pb2 import ImageSettings
+    old = b"\x12\x08\x08\xc0\x18\x10\x80\x80\x90\x06"
+    restored = ImageSettings.FromString(old)
+    assert restored.WhichOneof("profile") == "mimo"
+    assert restored.mimo.min_pixels == 3136
+    assert restored.mimo.max_pixels == 12845056
+    assert restored.SerializeToString() == old
+    assert ImageSettings.FromString(b"").WhichOneof("profile") is None

@@ -180,6 +180,7 @@ impl PreparedImageInput {
         let pixel_width = match self.processor.profile {
             Profile::Qwen(_) | Profile::MiMo(_) => 1536,
             Profile::Radio => 768,
+            Profile::Glm(_) => super::glm::PIXEL_WIDTH,
             _ => 588,
         };
         let patches = self.geometry.patches;
@@ -335,6 +336,9 @@ mod tests {
                 image_mean: [0.5; 3],
                 image_std: [0.5; 3],
             }),
+            ImageSettings::Glm(super::super::GlmImageSettings {
+                min_image_tokens: 16, max_image_tokens: 2048, patch_expand_factor: 1,
+            }),
             ImageSettings::Deepseek4 {},
             ImageSettings::DeepseekRowMajor(DeepseekRowMajorImageSettings {
                 min_pixels: 46656,
@@ -348,12 +352,14 @@ mod tests {
     }
 
     fn processor(settings: ImageSettings) -> Arc<ImageProcessor> {
+        let patches_per_feature = if matches!(&settings, ImageSettings::Glm(_)) { 4 } else { 1 };
         Arc::new(
             ImageProcessor::load(
                 settings,
                 ImageLimits {
                     max_patches_per_image: 65536,
                     max_total_patches: 65536,
+                    patches_per_feature,
                     ..Default::default()
                 },
             )

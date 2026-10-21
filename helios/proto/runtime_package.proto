@@ -320,6 +320,7 @@ enum ImagePreparationKind {
   STEP_IMAGE_PREPARATION = 5;
   RADIO_IMAGE_PREPARATION = 6;
   DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION = 7;
+  GLM_IMAGE_PREPARATION = 8;
 }
 enum ImageLayoutKind {
   IMAGE_LAYOUT_UNSPECIFIED = 0;
@@ -330,6 +331,7 @@ enum ImageLayoutKind {
   STEP_IMAGE_LAYOUT = 5;
   RADIO_IMAGE_LAYOUT = 6;
   DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT = 7;
+  GLM_IMAGE_LAYOUT = 8;
 }
 message ToolParser {
   ToolParserKind kind = 1;
@@ -447,7 +449,14 @@ message ImageSettings {
     Empty step = 5;
     Empty radio = 6;
     DeepseekRowMajorImageSettings deepseek_row_major = 7;
+    GlmImageSettings glm = 8;
   }
+}
+// GLM spatial/temporal patch algorithm; never selects scheduling or cache policy.
+message GlmImageSettings {
+  uint64 min_image_tokens = 1;
+  uint64 max_image_tokens = 2;
+  uint64 patch_expand_factor = 3;
 }
 message DeepseekRowMajorImageSettings {
   uint64 min_pixels = 1;

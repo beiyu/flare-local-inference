@@ -307,6 +307,26 @@ pub(super) fn prepare_inference_cached(
             config.limits.max_sequence_tokens,
         )?
     };
+    let string_stop_reasoning = if opts.stop_scope
+        == super::inference::StringStopScope::AfterReasoning
+        && !stop_strings.is_empty()
+    {
+        output
+            .as_ref()
+            .filter(|output| output.content.start == crate::output::tagged::OutputStart::Reasoning)
+            .and_then(|output| {
+                output.syntax.reasoning.as_ref().map(|syntax| {
+                    let mut syntax = syntax.clone();
+                    if output.content.tools.is_empty() {
+                        syntax.terminal_markers.clear();
+                    }
+                    syntax
+                })
+            })
+    } else {
+        None
+    };
+    super::stops::validate_initial_reasoning(string_stop_reasoning.as_ref())?;
     let ignore_eos = opts.ignore_eos;
     if ignore_eos && grammar.is_some() {
         return Err("structured output cannot ignore end-of-sequence tokens".into());
@@ -322,6 +342,7 @@ pub(super) fn prepare_inference_cached(
             max_new_tokens,
             stop_sequences,
             stop_strings,
+            string_stop_reasoning,
             grammar,
             ignore_eos,
             logprobs: opts.logprobs.is_some(),

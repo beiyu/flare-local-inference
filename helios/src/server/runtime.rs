@@ -31,6 +31,8 @@ pub struct Prompt {
     pub max_new_tokens: u32,
     pub stop_sequences: Vec<Vec<u32>>,
     pub stop_strings: Vec<String>,
+    /// Initial reasoning delimiters excluded from string-stop matching for this request.
+    pub string_stop_reasoning: Option<crate::model::contract::ReasoningParser>,
     pub grammar: Option<crate::grammar::RequestGrammar>,
     /// Generate through end-of-sequence tokens until the output limit, as vLLM's `ignore_eos`.
     pub ignore_eos: bool,
@@ -652,6 +654,7 @@ impl ModelRuntime {
                 !prompt.stop_sequences.is_empty(),
                 prompt.grammar.is_some(),
             )?;
+            super::stops::validate_initial_reasoning(prompt.string_stop_reasoning.as_ref())?;
             crate::model::admission::validate_prompt(&self.config, &prompt)
                 .map_err(|error| error.admission_context(AdmissionError::Invalid))?;
             let (events, receiver) = async_mpsc::channel(self.event_capacity);
@@ -1174,7 +1177,8 @@ impl<'a> Worker<'a> {
                     text_stops: if incoming.prompt.stop_strings.is_empty() {
                         None
                     } else {
-                        let mut stops = super::stops::TextStops::new(self.frontend, incoming.prompt.stop_strings.clone())?;
+                        let mut stops = super::stops::TextStops::new(self.frontend, incoming.prompt.stop_strings.clone())?
+                            .with_initial_reasoning(incoming.prompt.string_stop_reasoning.as_ref())?;
                         if incoming.prompt.logprobs {
                             stops.track(self.frontend);
                         }
@@ -2340,6 +2344,7 @@ mod tests {
                 max_new_tokens: 10,
                 stop_sequences: vec![],
                 stop_strings: vec![],
+                string_stop_reasoning: None,
                 logprobs: false,
                 ignore_eos: false,
                 grammar: None,

@@ -55,6 +55,9 @@ pub fn prepare_image_inputs(
         Some(ImageLayoutKind::Step) => crate::frontend::images::layouts::step::prepare_input(
             frontend, processor, rendered, &images,
         )?,
+        Some(ImageLayoutKind::Glm) => crate::frontend::images::layouts::glm::prepare_input(
+            frontend, processor, rendered, &images,
+        )?,
         Some(ImageLayoutKind::Mimo) => crate::frontend::images::layouts::mimo::prepare_input(
             frontend, processor, rendered, &images,
         )?,
@@ -319,6 +322,8 @@ mod tests {
             "<｜deepseek_image｜>", "<|media_pad|>", "<|media_begin|>", "<|media_content|>",
             "<|media_end|>", "<im_patch>", "<patch_start>", "<patch_end>", "<patch_newline>",
             "<im_start>", "<im_end>", "<image>", "<img>", "</img>",
+            "<|begin_of_image|>", "<|image|>", "<|end_of_image|>",
+            "<|begin_of_video|>", "<|video|>", "<|end_of_video|>",
         ].map(|text| tokenizers::AddedToken::from(text, true))).unwrap();
         let asset = |name: &str, bytes: &[u8]| {
             let path = root.join(name); std::fs::write(&path, bytes).unwrap();
@@ -412,6 +417,99 @@ mod tests {
             assert!(validate_conditioned_inputs(&oversized, &prepared.tokens, &prepared.data,
                 &prepared.conditioned_inputs).is_err());
         }
+    }
+
+    #[test]
+    fn glm_images_follow_the_real_description_prompt_materialization_and_upload_path() {
+        use crate::frontend::images::{GlmImageSettings, ImageLimits, ImageSettings};
+        use crate::model::contract::{ImagePreparationKind, ImageSpan, ImageTokenLayout};
+        let frontend = image_frontend();
+        let token = |text: &str| frontend.encode(text, false).unwrap()[0];
+        let settings = ImageSettings::Glm(GlmImageSettings {
+            min_image_tokens: 16, max_image_tokens: 2048, patch_expand_factor: 1,
+        });
+        let mut config = super::super::tests::config();
+        config.limits.max_sequence_tokens = 8192;
+        config.limits.max_active = 2;
+        config.contract.vocabulary = 1000;
+        config.contract.input_vocabulary = 1000;
+        config.contract.vision = crate::model::VisionCapabilities {
+            feature_slots: 2, features_per_request: 16, max_images: 1,
+            patches_per_feature: 4, patch_capacities: vec![64],
+        };
+        config.contract.frontend.image_layout = Some(ImageLayoutKind::Glm);
+        config.contract.frontend.image_preparation = Some(ImagePreparationKind::Glm);
+        config.contract.frontend.position_dimensions = 0;
+        config.contract.frontend.rejected_tokens.clear();
+        config.contract.frontend.image_tokens = Some(ImageTokenLayout {
+            feature_token: token("<|image|>"),
+            span: Some(ImageSpan { start_token: token("<|begin_of_image|>"),
+                end_token: token("<|end_of_image|>"), max_tokens: 2050,
+                interior_tokens: vec![], unscoped_tokens: vec![] }),
+        });
+        let processor = ImageProcessor::load(settings, ImageLimits {
+            max_images: 20, max_total_patches: 20 * 64,
+            max_patches_per_image: 64, patches_per_feature: 4, ..Default::default()
+        }).unwrap();
+        let marker = "<|begin_of_image|><|image|><|end_of_image|>";
+        let text = format!("a{}z", marker.repeat(20));
+        let rendered = RenderedPrompt { token_ids: frontend.encode(&text, false).unwrap(),
+            text, image_sources: vec![] };
+        let images = (0..20).map(|i| RgbImage::new(112, 112, vec![i; 112 * 112 * 3]).unwrap()).collect();
+        let prepared = prepare_input(&config, &frontend, Some(&processor), &rendered, images).unwrap();
+        assert_eq!(prepared.conditioned_inputs.len(), 20);
+        assert_eq!(prepared.data.spans.len(), 20);
+        assert_eq!(prepared.tokens.len(), 2 + 20 * 18);
+        assert!(prepared.data.positions.is_empty());
+        assert_eq!(processor.preparation_counts().prepared_images, 0);
+        for (i, input) in prepared.conditioned_inputs.iter().enumerate() {
+            assert_eq!(input.feature_range, i * 16..(i + 1) * 16);
+            assert_eq!(input.token_span, 2 + i * 18..18 + i * 18);
+            assert_eq!(prepared.data.spans[i], 1 + i * 18..19 + i * 18);
+        }
+        let first = prepared.conditioned_inputs[0].materialize().unwrap();
+        let second = prepared.conditioned_inputs[1].materialize().unwrap();
+        assert_ne!(first.pixel_values, second.pixel_values);
+        let staging = crate::frontend::images::packing::prepare(&config,
+            crate::scheduler::RequestHandle { slot: 0, generation: 1 }, &second, 0, 0).unwrap();
+        let uploads = staging.uploads();
+        let pixels = uploads.iter().find(|u| u.buffer == "vision_pixel_values").unwrap();
+        assert_eq!(pixels.bytes.len(), 64 * 1176 * 4);
+        assert_eq!(pixels.bytes, second.pixel_values.iter().copied().flat_map(f32::to_le_bytes).collect::<Vec<_>>());
+        assert_eq!(crate::frontend::images::packing::tensor_layout(ImageLayoutKind::Glm,
+            "vision_pixel_values", 64).unwrap(), (crate::execution::Dtype::Float32, 64 * 1176));
+        assert_eq!(uploads.iter().find(|u| u.buffer == "vision_num_features").unwrap().bytes, 16i32.to_le_bytes());
+        assert!(crate::frontend::images::packing::prepare(&config,
+            crate::scheduler::RequestHandle { slot: 1, generation: 1 }, &second, 0, 0).is_ok());
+        for handle in [crate::scheduler::RequestHandle { slot: 2, generation: 1 },
+            crate::scheduler::RequestHandle { slot: 0, generation: 0 }] {
+            assert!(crate::frontend::images::packing::prepare(&config, handle, &second, 0, 0).is_err());
+        }
+        for name in ["vision_pixel_values", "vision_position_ids"] {
+            assert!(crate::frontend::images::packing::tensor_layout(ImageLayoutKind::Glm,
+                name, usize::MAX).is_err());
+        }
+        let over_limit = RenderedPrompt { token_ids: frontend.encode(&marker.repeat(21), false).unwrap(),
+            text: marker.repeat(21), image_sources: vec![] };
+        let images = (0..21).map(|_| RgbImage::new(112, 112, vec![0; 112 * 112 * 3]).unwrap()).collect();
+        assert!(prepare_input(&config, &frontend, Some(&processor), &over_limit, images).is_err());
+        for invalid in ["<|image|>", "<|begin_of_image|><|image|>",
+            "<|begin_of_video|><|video|><|end_of_video|>"] {
+            let rendered = RenderedPrompt { token_ids: frontend.encode(invalid, false).unwrap(),
+                text: invalid.into(), image_sources: vec![] };
+            assert!(prepare_input(&config, &frontend, Some(&processor), &rendered, vec![]).is_err());
+        }
+        let mut overflow = second.clone();
+        overflow.geometry = vec![second.geometry[0]; 3];
+        overflow.geometry[0].patches = usize::MAX;
+        overflow.geometry[1].patches = 1;
+        let error = crate::frontend::images::packing::prepare(&config,
+            crate::scheduler::RequestHandle { slot: 0, generation: 1 }, &overflow, 2, 0).err().unwrap();
+        assert!(error.to_string().contains("GLM patch range overflows"));
+        let mut malformed = second;
+        malformed.pixel_values.pop();
+        assert!(crate::frontend::images::packing::prepare(&config,
+            crate::scheduler::RequestHandle { slot: 0, generation: 1 }, &malformed, 0, 0).is_err());
     }
 
     #[test]

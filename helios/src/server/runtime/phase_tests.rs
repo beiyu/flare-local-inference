@@ -192,6 +192,7 @@ impl Fixture {
                     max_new_tokens: limit,
                     stop_sequences: vec![],
                     stop_strings: vec![],
+                    string_stop_reasoning: None,
                     logprobs: false,
                     ignore_eos: false,
                     grammar: None,
@@ -576,6 +577,131 @@ fn output_clock_advances_only_after_stop_buffering_releases_tokens() {
             .last_output_ns,
         published
     );
+}
+
+#[test]
+fn initial_reasoning_string_stops_keep_worker_eos_length_cancel_and_user_stop_distinct() {
+    use crate::output::{Piece, Termination};
+    for outcome in ["user", "eos", "length", "cancel"] {
+        let mut fixture = Fixture::new();
+        fixture.frontend = crate::server::output::tests::frontend(&[
+            "STOP</thi",
+            "nk>answerSTOPdiscard",
+            "prompt",
+            "x",
+            "y",
+            "<eos>",
+        ]);
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) =
+            fixture.incoming(vec![2; 13], if outcome == "length" { 1 } else { 8 });
+        incoming.prompt.stop_strings = vec!["STOP".into()];
+        incoming.prompt.string_stop_reasoning = Some(crate::model::contract::ReasoningParser {
+            kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+            open: "<think>".into(),
+            close: "</think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        assert!(incoming.prompt.has_host_stops());
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let handle = worker.active[0].as_ref().unwrap().request;
+        assert!(worker.scheduler.request(handle).unwrap().host_stops());
+        advance(&mut worker, GraphKind::Init, 1, None);
+        advance(&mut worker, GraphKind::Prefill, 2, Some(0));
+        assert_eq!(
+            worker.scheduler.request(handle).unwrap().generated_tokens,
+            1
+        );
+        advance(&mut worker, GraphKind::Snapshot, 3, None);
+        if outcome == "cancel" {
+            generation.cancelled.store(true, Ordering::Release);
+            assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+            assert_eq!(fixture.metrics.cancelled.load(Ordering::Relaxed), 1);
+        } else if outcome == "length" {
+            assert!(worker.publish().unwrap());
+        } else {
+            let step = planned(&mut worker, GraphKind::Decode, 4);
+            assert_eq!(step.token_capacity, 1);
+            let mut frame = completion(
+                &worker,
+                &step,
+                4,
+                Some(if outcome == "eos" { 5 } else { 1 }),
+            );
+            if outcome == "eos" {
+                frame.records[handle.slot as usize].status = 2;
+            }
+            worker.complete(GraphKind::Decode, frame).unwrap();
+            if outcome == "eos" {
+                assert_eq!(
+                    worker.scheduler.request(handle).unwrap().phase,
+                    RequestPhase::Snapshot
+                );
+                assert!(!worker.publish().unwrap());
+                advance(&mut worker, GraphKind::Snapshot, 5, None);
+                assert!(worker.publish().unwrap());
+            }
+        }
+        let mut visible = String::new();
+        let mut observed = vec![];
+        let mut finished = None;
+        while let Ok(event) = generation.events.try_recv() {
+            match event {
+                GenerationEvent::Protocol(pieces) => {
+                    for piece in pieces {
+                        if let Piece::Text(text) = piece {
+                            visible.push_str(&text);
+                        }
+                    }
+                }
+                GenerationEvent::ObservedToken { token, .. } => observed.push(token),
+                GenerationEvent::Finished {
+                    reason,
+                    termination,
+                    stop_sequence,
+                    generated_tokens,
+                    ..
+                } => {
+                    finished = Some((reason, termination, stop_sequence, generated_tokens));
+                }
+                GenerationEvent::Error(error) => panic!("{outcome}: {error}"),
+                _ => {}
+            }
+        }
+        match outcome {
+            "user" => {
+                assert_eq!(visible, "STOP</think>answer");
+                assert_eq!(observed, [0, 1]);
+                assert_eq!(
+                    finished,
+                    Some(("stop", Termination::UserStop, Some("STOP".into()), 2))
+                );
+            }
+            "eos" => {
+                assert_eq!(visible, "STOP</thi");
+                assert_eq!(observed, [0, 5]);
+                assert_eq!(finished, Some(("stop", Termination::Eos, None, 2)));
+            }
+            "length" => {
+                assert_eq!(visible, "STOP</thi");
+                assert_eq!(observed, [0]);
+                assert_eq!(
+                    finished,
+                    Some(("length", Termination::OutputLimit, None, 1))
+                );
+            }
+            _ => {
+                assert_eq!(visible, "");
+                assert_eq!(observed, [0]);
+                assert!(finished.is_none());
+            }
+        }
+        assert!(worker.active.iter().all(Option::is_none));
+        assert_eq!(worker.scheduler.stats().active_requests, 0);
+    }
 }
 
 #[test]

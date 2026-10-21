@@ -150,6 +150,11 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                 Profile::Moonvit(_) => serde_json::json!({"moonvit": {}}),
                 Profile::Step(_) => serde_json::json!({"step": {}}),
                 Profile::Radio(_) => serde_json::json!({"radio": {}}),
+                Profile::Glm(config) => serde_json::json!({"glm": {
+                    "min_image_tokens": config.min_image_tokens,
+                    "max_image_tokens": config.max_image_tokens,
+                    "patch_expand_factor": config.patch_expand_factor,
+                }}),
             })
         })
         .transpose()?;
@@ -316,6 +321,33 @@ pub(super) fn edge(value: wire::Edge) -> Result<Edge> {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn glm_image_settings_preserve_legacy_profiles_and_absent_image_fields() {
+        let old = b"\x12\x08\x08\xc0\x18\x10\x80\x80\x90\x06";
+        let legacy = wire::ImageSettings::decode(old.as_slice()).unwrap();
+        let Some(wire::image_settings::Profile::Mimo(ref image)) = legacy.profile else { panic!("legacy profile changed") };
+        assert_eq!((image.min_pixels, image.max_pixels), (3136, 12845056));
+        assert_eq!(legacy.encode_to_vec(), old);
+        let frontend_bytes = b"\x0a\x00\x1a\x01\x11";
+        let legacy_frontend = wire::FrontendSettings::decode(frontend_bytes.as_slice()).unwrap();
+        assert!(frontend_settings(legacy_frontend).unwrap()["image"].is_null());
+        let value = wire::FrontendSettings {
+            tokenizer: Some(Default::default()), eos_token_ids: vec![17],
+            image: Some(wire::ImageSettings { profile: Some(wire::image_settings::Profile::Glm(
+                wire::GlmImageSettings { min_image_tokens: 16, max_image_tokens: 2048, patch_expand_factor: 1 })) }),
+            ..Default::default()
+        };
+        let json = frontend_settings(wire::FrontendSettings::decode(value.encode_to_vec().as_slice()).unwrap()).unwrap();
+        assert_eq!(json["image"]["glm"]["max_image_tokens"], 2048);
+        #[cfg(feature = "images")]
+        {
+            let settings: crate::frontend::images::ImageSettings = serde_json::from_value(json["image"].clone()).unwrap();
+            let processor = crate::frontend::images::ImageProcessor::load(settings,
+                crate::frontend::images::ImageLimits { patches_per_feature: 4, ..Default::default() }).unwrap();
+            assert_eq!(processor.geometry(112, 112).unwrap().tokens, 16);
+        }
+    }
 
     #[test]
     fn rebuild_catalogs_do_not_change_native_bundle_loading() {

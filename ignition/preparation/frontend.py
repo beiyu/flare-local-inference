@@ -44,6 +44,28 @@ def _expected(config, values, label):
 
 
 def image_settings(config, model, profile):
+    if profile == "glm":
+        _expected(config, {"processor_class": "Glm5NextProcessor"}, "GLM processor")
+        image = config["image_processor"]
+        _expected(image, {"image_processor_type": "Glm5NextImageProcessor", "patch_size": 14,
+            "temporal_patch_size": 2, "merge_size": 2,
+            "image_mean": [0.48145466, 0.4578275, 0.40821073],
+            "image_std": [0.26862954, 0.26130258, 0.27577711]}, "GLM image processor")
+        optional = {"do_resize": True, "do_rescale": True, "do_normalize": True,
+            "do_convert_rgb": True, "rescale_factor": 1 / 255, "resample": 3, "resize_mode": "pad"}
+        _expected(image, {key: value for key, value in optional.items() if key in image}, "GLM image processor")
+        _expected(model, {"model_type": "glm5_next", "image_token_id": 154854,
+            "image_start_token_id": 154830, "image_end_token_id": 154831}, "GLM image configuration")
+        _expected(model["vision_config"], {"patch_size": 14, "temporal_patch_size": 2,
+            "spatial_merge_size": 2, "in_channels": 3}, "GLM vision configuration")
+        values = {key: image.get(key) for key in ("min_image_tokens", "max_image_tokens", "patch_expand_factor")}
+        if (any(type(value) is not int or not 0 < value < 2**64 for value in values.values())
+                or values["max_image_tokens"] > (2**64 - 1) // (2 * 28**2)
+                or values["patch_expand_factor"] > (2**64 - 1) // 28
+                or values["max_image_tokens"] < values["min_image_tokens"]
+                or values["patch_expand_factor"]**2 > values["max_image_tokens"]):
+            raise ValueError("invalid GLM image token budgets or patch expansion")
+        return {"glm": values}
     if profile == "radio":
         _expected(config, {"image_processor_type": "NemotronH_Omni_Reasoning_V3ImageProcessor",
             "patch_size": 16, "downsample_ratio": .5, "max_model_len": 16384,
@@ -151,7 +173,8 @@ def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocesso
                 raise ValueError("image profile differs from the prompt encoder")
             result["image_placeholder_token_id"] = _native_image_placeholder(
                 snapshot, json.loads((snapshot / "config.json").read_text()), prompt_encoder)
-        path = snapshot / "preprocessor_config.json" if preprocessor is None else Path(preprocessor)
+        filename = "processor_config.json" if image_profile == "glm" else "preprocessor_config.json"
+        path = snapshot / filename if preprocessor is None else Path(preprocessor)
         result["image"] = image_settings({} if image_profile == "deepseek_row_major" else json.loads(path.read_text()),
             json.loads((snapshot / "config.json").read_text()), image_profile)
     return result

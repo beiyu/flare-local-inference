@@ -1,3 +1,5 @@
+Beiyu GLM compatibility work: [scope, tests and migration gates](docs/beiyu-glm.md).
+
 <p align="center">
   <img src="docs/images/flare-logo.png" alt="Flare — ASCII wordmark above a solar flare" width="912">
 </p>

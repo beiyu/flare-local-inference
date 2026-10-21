@@ -520,6 +520,21 @@ include the declared media type, source bytes, and processor settings.
 Animation, video, and remote URL fetching are unsupported. Decoding and
 preprocessing execute in Rust.
 
+The GLM image frontend implements the deployment's upward-aligned padded
+canvases, CLIP normalization, 14×14 patches with two temporal copies, 2×2
+spatial ordering, atomic image-token spans, and graph-input packing. Its typed
+settings read the nested `processor_config.json` image configuration. This is
+frontend support only: the `glm53` recipe remains text-only until its BF16 vision
+encoder/projector, captured graphs and decoder feature injection are integrated
+and validated. Video remains unsupported. CPU processor parity is checked with
+`tests/frontend/generate_glm_image_fixtures.py` against the deployment's actual
+processor; these fixtures do not qualify GPU vision or full image serving.
+
+```bash
+cargo run --manifest-path helios/Cargo.toml --features images,test-tools \
+  --bin test_glm_images -- tests/frontend/glm53_images.json
+```
+
 The resize coefficient generator and integer convolution follow PyTorch
 [`UpSampleKernel.cpp`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/cpu/UpSampleKernel.cpp)
 and its uint8 antialias implementation at `cf30153c4c131c8164ee7798e5022d810682e2cb`;

@@ -112,6 +112,13 @@ pub struct LogprobOptions {
     pub token_ids: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StringStopScope {
+    #[default]
+    All,
+    AfterReasoning,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Options {
     pub sampling: Sampling,
@@ -119,6 +126,7 @@ pub struct Options {
     pub effort: Option<Effort>,
     pub output_limit: Option<u64>,
     pub stops: Vec<String>,
+    pub stop_scope: StringStopScope,
     pub token_stops: Vec<Vec<u32>>,
     pub constraint: Option<Constraint>,
     pub ignore_eos: bool,

@@ -141,3 +141,10 @@ path = "tests/tools/test_radio_images.rs"
 required-features = ["server", "test-tools"]
 test = false
 bench = false
+
+[[bin]]
+name = "test_glm_images"
+path = "tests/tools/test_glm_images.rs"
+required-features = ["images", "test-tools"]
+test = false
+bench = false

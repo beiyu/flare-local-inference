@@ -396,6 +396,12 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
     } else {
         "stop"
     }))?;
+    options.stop_scope = match body.get("stop_scope") {
+        None | Some(Value::Null) => StringStopScope::All,
+        Some(Value::String(scope)) if scope == "all" => StringStopScope::All,
+        Some(Value::String(scope)) if scope == "after_reasoning" => StringStopScope::AfterReasoning,
+        _ => return Err("stop_scope must be all or after_reasoning".into()),
+    };
     if present(body, "stop_token_sequences") {
         options.token_stops = serde_json::from_value(body["stop_token_sequences"].clone())
             .map_err(|_| "invalid stop_token_sequences")?;
@@ -797,6 +803,58 @@ mod tests {
         }
     }
     #[test]
+    fn string_stop_scope_is_explicit_and_shared_by_every_protocol() {
+        for (protocol, input) in [
+            (
+                Protocol::Chat,
+                json!({"messages":[{"role":"user","content":"hello"}]}),
+            ),
+            (
+                Protocol::Messages,
+                json!({"max_tokens":8,"messages":[{"role":"user","content":"hello"}]}),
+            ),
+            (Protocol::Responses, json!({"input":"hello"})),
+            (Protocol::Completions, json!({"prompt":"hello"})),
+        ] {
+            assert_eq!(
+                decode(protocol, input.clone(), false)
+                    .unwrap()
+                    .request
+                    .options
+                    .stop_scope,
+                StringStopScope::All
+            );
+            for (value, expected) in [
+                (Value::Null, StringStopScope::All),
+                (json!("all"), StringStopScope::All),
+                (json!("after_reasoning"), StringStopScope::AfterReasoning),
+            ] {
+                let mut body = input.clone();
+                body["stop_scope"] = value;
+                assert_eq!(
+                    decode(protocol, body, false)
+                        .unwrap()
+                        .request
+                        .options
+                        .stop_scope,
+                    expected
+                );
+            }
+            for value in [
+                json!(true),
+                json!(1),
+                json!([]),
+                json!("answer"),
+                json!("ALL"),
+            ] {
+                let mut body = input.clone();
+                body["stop_scope"] = value;
+                assert!(decode(protocol, body, false).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn response_tool_arguments_round_trip_without_changing_json_types() {
         let expected = serde_json::json!({"query":"café 世界","options":{"count":2,"enabled":true,"none":null,"items":[1,"✓"]}});
         let mut message = serde_json::json!({"role":"assistant","tool_calls":[{"type":"function","id":"call_1","function":{"name":"search","arguments":expected.to_string()}}]});
@@ -1022,6 +1080,61 @@ mod native_prompt_tests {
             .err()
             .unwrap();
             assert!(error.to_string().contains("does not support continue_final_message"), "{error}");
+        }
+    }
+
+    #[test]
+    fn string_stop_guard_is_lowered_only_for_explicit_initial_reasoning() {
+        for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+            let (frontend, compiler, config) = native(encoder);
+            for (protocol, input) in [
+                (
+                    Protocol::Chat,
+                    json!({"messages":[{"role":"user","content":"hello"}]}),
+                ),
+                (
+                    Protocol::Messages,
+                    json!({"max_tokens":8,"messages":[{"role":"user","content":"hello"}]}),
+                ),
+                (Protocol::Responses, json!({"input":"hello"})),
+                (Protocol::Completions, json!({"prompt":"hello"})),
+            ] {
+                for thinking in [true, false] {
+                    for scope in [None, Some("all"), Some("after_reasoning")] {
+                        let mut body = input.clone();
+                        body["model"] = config.model_id.clone().into();
+                        body["chat_template_kwargs"] = json!({"enable_thinking":thinking});
+                        body[if protocol == Protocol::Messages {
+                            "stop_sequences"
+                        } else {
+                            "stop"
+                        }] = json!(["STOP"]);
+                        if let Some(scope) = scope {
+                            body["stop_scope"] = scope.into();
+                        }
+                        let decoded = decode(protocol, body, false).unwrap();
+                        let prepared = crate::server::request::prepare_inference(
+                            &frontend,
+                            None,
+                            &compiler,
+                            &config,
+                            &decoded.request,
+                            0,
+                            false,
+                        )
+                        .unwrap();
+                        let guarded = protocol != Protocol::Completions
+                            && thinking
+                            && scope == Some("after_reasoning");
+                        assert_eq!(
+                            prepared.prompt.string_stop_reasoning.is_some(),
+                            guarded,
+                            "{encoder:?} {protocol:?} {thinking} {scope:?}"
+                        );
+                        assert!(prepared.prompt.stop_strings == ["STOP"]);
+                    }
+                }
+            }
         }
     }
 

@@ -174,8 +174,17 @@ is independent of model identity.
 strings totaling at most 4096 UTF-8 bytes. An empty array disables string stops.
 String stops cannot be combined with token-stop IDs/sequences or structured
 output. Matching uses incremental decoded text, including reasoning and tool
-envelopes, before presentation. The first completed match removes the matched
-string and its suffix, including text within the same sampled token. Partial
+envelopes, before presentation. Explicit request `stop_scope="after_reasoning"`
+excludes the initial reasoning envelope when generation starts inside it, using
+its prepared close and implicit terminal markers. The close delimiter is
+excluded; an implicit terminal begins eligible output. Later envelopes do not
+rearm the guard. Absent, null, or `"all"` scope preserves whole-stream matching,
+including for existing packages without re-export. Raw and nonthinking requests
+retain ordinary matching. String stops with initial XTML reasoning reject
+`after_reasoning` at request admission because its boundaries require control-token
+identity; default whole-stream matching remains supported. The first completed
+match removes the matched string and its suffix, including text within the same
+sampled token. Partial
 UTF-8 and overlapping stop prefixes remain buffered until resolved. Normal
 EOS or output-limit termination flushes an unmatched prefix.
 

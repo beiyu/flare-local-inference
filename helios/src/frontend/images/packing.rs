@@ -22,12 +22,16 @@ pub(crate) fn tensor_layout(
             "vision_pixel_values",
         ) => (Float32, patches * 588),
         (ImageLayoutKind::Radio, "vision_pixel_values") => (Float32, patches * 768),
+        (ImageLayoutKind::Glm, "vision_pixel_values") => (Float32,
+            patches.checked_mul(super::glm::PIXEL_WIDTH).ok_or("GLM pixel tensor extent overflows")?),
+        (ImageLayoutKind::Glm, "vision_position_ids") => (Int64,
+            patches.checked_mul(2).ok_or("GLM position tensor extent overflows")?),
         (_, "vision_position_ids") => (Int64, patches * 2),
         (ImageLayoutKind::Step, "vision_cu_seqlens") => (Int32, super::step::MAX_VIEWS + 1),
         (_, "vision_cu_seqlens") => (Int32, 2),
         (_, "vision_num_patches" | "vision_feature_offset") => (Int32, 1),
         (
-            ImageLayoutKind::Mimo
+            ImageLayoutKind::Mimo | ImageLayoutKind::Glm
             | ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
@@ -79,6 +83,7 @@ pub(crate) fn prepare(
         .ok_or("image layout is not prepared")? {
         ImageLayoutKind::Qwen => qwen(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Mimo => mimo(config, handle, images, image, destination_feature_offset),
+        ImageLayoutKind::Glm => glm(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor => deepseek(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Moonvit | ImageLayoutKind::Radio => spatial_merge(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Step => step(config, handle, images, image, destination_feature_offset),
@@ -182,6 +187,41 @@ fn qwen(
         0,
         [destination_feature_offset as i32],
     );
+    Ok(staging)
+}
+
+fn glm(
+    config: &ModelConfig, handle: RequestHandle, images: &ProcessedImages,
+    image: usize, destination_feature_offset: usize,
+) -> Result<UploadBatch> {
+    let geometry = images.geometry.get(image).ok_or("missing scheduled image")?;
+    let start = images.geometry[..image].iter()
+        .try_fold(0usize, |total, geometry| total.checked_add(geometry.patches))
+        .ok_or("GLM patch range overflows")?;
+    let end = start.checked_add(geometry.patches).ok_or("GLM patch range overflows")?;
+    let patches = i32::try_from(geometry.patches).map_err(|_| "GLM patch count exceeds int32")?;
+    let features = i32::try_from(geometry.tokens).map_err(|_| "GLM feature count exceeds int32")?;
+    let height = usize::try_from(geometry.grid_thw[1]).map_err(|_| "invalid GLM grid height")?;
+    let width = usize::try_from(geometry.grid_thw[2]).map_err(|_| "invalid GLM grid width")?;
+    if config.contract.vision.patches_per_feature != 4
+        || geometry.grid_thw[0] != 1 || height == 0 || width == 0 || height % 2 != 0 || width % 2 != 0
+        || height.checked_mul(width) != Some(geometry.patches)
+        || geometry.tokens.checked_mul(4) != Some(geometry.patches)
+        || geometry.patches > config.contract.vision.patch_capacities.last().copied().unwrap_or(0)
+        || handle.slot as usize >= config.limits.max_active || handle.generation == 0
+        || handle.generation > i64::MAX as u64
+    { return Err("invalid GLM vision graph input extent".into()); }
+    let pixel_start = start.checked_mul(super::glm::PIXEL_WIDTH).ok_or("GLM pixel range overflows")?;
+    let pixel_end = end.checked_mul(super::glm::PIXEL_WIDTH).ok_or("GLM pixel range overflows")?;
+    let mut staging = UploadBatch::default();
+    staging.put("vision_pixel_values", 0, images.pixel_values.get(pixel_start..pixel_end)
+        .ok_or("truncated GLM vision pixels")?.iter().copied().flat_map(f32::to_le_bytes));
+    staging.i64("vision_position_ids", 0, images.position_ids.get(start..end)
+        .ok_or("truncated GLM vision positions")?.iter().flatten().copied());
+    staging.i32("vision_cu_seqlens", 0, [0, patches]);
+    staging.i32("vision_num_patches", 0, [patches]);
+    staging.i32("vision_num_features", 0, [features]);
+    staging.i32("vision_feature_offset", 0, [destination_feature_offset as i32]);
     Ok(staging)
 }
 
