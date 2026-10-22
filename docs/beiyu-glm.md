@@ -12,6 +12,15 @@ still differs from ordinary decode, so complete numerical equivalence and
 comparative performance remain unqualified. The earlier ordinary package and
 launch configuration are retained for restoration.
 
+The user selected the production scheduler on 2026-10-22 after the interleaved
+recheck: `--scheduler-policy throughput --mtp-draft-tokens 4`. Both native ranks
+were reloaded and their live arguments verified; NewAPI 8889 text/image smoke
+checks passed. Checkpoint precision, image processing, default thinking and the
+package concurrency of four are retained. Full numerical qualification remains
+open. The prior launcher is saved on each host as
+`/workspace/runtime/flare-beiyu/service/start-native.sh.before-throughput4-20261022`.
+See [the measurements and production choice](glm53-performance-20261022.md).
+
 ## Implemented boundaries
 
 - The EXL3 expert-layer gate is complete for the qualified slices below. The

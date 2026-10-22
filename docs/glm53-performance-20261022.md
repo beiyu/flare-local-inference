@@ -73,6 +73,14 @@ python3 -m qualify.glm_scheduler_recheck_summary \
 
 新增 4 项真实 HTTP/SSE/汇总检查，加上既有 4 项，共 8 项 CPU 检查通过，包括逐请求计数污染拒绝、部分记录权限，以及缓存不同时不能纳入同输出速度子集。
 
+## 用户授权后的生产配置
+
+2026-10-22，用户在上述结果和未通过的输出一致性验收已说明后，明确要求切换生产。选择 `--scheduler-policy throughput --mtp-draft-tokens 4`，两台均持久写入 `/workspace/runtime/flare-beiyu/service/start-native.sh`。原权重包、EXL3/BF16精度、图像处理、默认思考、并发上限4与服务单元均保持原值。
+
+两台原生进程实际参数已核对为4/throughput，原生健康检查通过，NewAPI 8889 文字64token/图片128token的HTTP/SSE复验均通过。验收文件位于 spark-01 `/workspace/outputs/flare-beiyu/production-throughput4-20261022/acceptance.json`。这是用户选择的生产运行配置，完整模型数值一致性仍为未完成项，前面的失败对照保留。
+
+每台原脚本保存在 `start-native.sh.before-throughput4-20261022`（与当前脚本同目录），对应旧7/balanced配置。回退时先停止两台 `flare-beiyu.service`，分别恢复备份，再启动两台并检查9999及8889。之前的原配置指纹只描述旧7/balanced基线，后续测量必须识别当前生产已经是4/throughput。
+
 ## 词表通信和候选合并
 
 对实际 TP2 head 权重、8 行 BF16 隐藏向量进行组件测量。每个路径捕获 CUDA graph，通过 native worker 重放，每项 7 组 × 32 次，检查 GPU 分配计数不变，并保留 CUPTI 核函数时间线。
