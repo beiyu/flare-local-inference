@@ -1,5 +1,7 @@
 # Beiyu GLM compatibility branch
 
+中文总览：[GLM 5.3 适配总结与其他模型接入指南](glm53-migration-summary.md)。
+
 This fork preserves the existing two-Spark GLM deployment as the migration
 reference: routed experts remain EXL3 K4 MCG, non-expert and vision weights retain
 their original precision, and the same BF16 donor `o_proj` tensors must be used.
@@ -422,7 +424,8 @@ accepts `spark/GLM-5.3-Flash-EXL3`, with listener port 9999, 65536 omitted outpu
 limit, and reasoning-aware string stops. Request
 values can override the latter defaults. The custom template and donors must
 already be captured in the prepared package; the entrypoint does not interpret
-legacy environment variables. It disables speculation for this ordinary export.
+legacy environment variables. The ordinary export has no speculative graphs;
+the DFlash2 export uses the explicit production settings recorded above.
 
 The confirmed daily entry point is authenticated NewAPI on port 8889. Its
 channel accepts request/discovery alias `spark/GLM-5.3-Flash-EXL3`. Native 9999
@@ -550,8 +553,10 @@ reused. The transfer listener has stopped, and both preparation containers are
 stopped. Preparation itself read authenticated local checkpoint files on both
 Sparks, with no remote tensor payloads on rank 1.
 
-The launch wrapper follows package defaults: adaptive DFlash2 up to seven drafts.
-For an ordinary comparison, append `--mtp-draft-tokens 0`. Startup retains full
+The package supports adaptive DFlash2 up to seven drafts. Since the user-selected
+production change on 2026-10-22, both persistent launchers explicitly select
+`--scheduler-policy throughput --mtp-draft-tokens 4`. For an ordinary comparison,
+select `--mtp-draft-tokens 0` in an isolated launcher. Startup retains full
 stored-data verification. Before replacement, task-local launchers and deployment
 metadata were saved as `*.before-dflash2` under
 `/workspace/runtime/flare-beiyu/service/`. The earlier ordinary package above
